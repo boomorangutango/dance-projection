@@ -46,13 +46,15 @@
     backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   }
   #controls.show { display: flex; }
-  .modes, .styles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .modes, .styles, .looks { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .modes, .looks { grid-template-columns: repeat(5, 1fr); }
+  .modes button, .looks button { font-size: 12px !important; padding: 9px 2px !important; }
   .styles button { font-size: 12px !important; padding: 8px 4px !important; }
-  .modes button, .styles button, .row button {
+  .modes button, .styles button, .looks button, .row button {
     padding: 10px 8px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d0d; color: var(--fg);
     font-size: 14px;
   }
-  .modes button.on, .styles button.on, .row button.on { border-color: var(--fg); background: #222; }
+  .modes button.on, .styles button.on, .looks button.on, .row button.on { border-color: var(--fg); background: #222; }
   .row { display: flex; gap: 6px; flex-wrap: wrap; }
   .row button { flex: 1 1 auto; font-size: 13px; }
   .row button:disabled { opacity: 0.45; }
@@ -96,6 +98,18 @@
     <button data-mode="trails">Trails</button>
     <button data-mode="paint">Paint</button>
     <button data-mode="partner">Partner</button>
+    <button data-mode="field">Field</button>
+  </div>
+
+  <div class="section">
+    <div class="label">Look <span id="lookNote" style="text-transform:none; letter-spacing:0;"></span></div>
+    <div class="looks" id="looks">
+      <button data-look="crisp">Crisp</button>
+      <button data-look="smooth">Smooth</button>
+      <button data-look="calm">Calm</button>
+      <button data-look="bold">Bold</button>
+      <button data-look="dreamy">Dreamy</button>
+    </div>
   </div>
 
   <div class="section">
@@ -116,6 +130,15 @@
     <label class="slider">Color speed <input data-key="hueSpeed" type="range" min="0" max="1" step="0.01"><span></span></label>
     <div class="row"><button id="clearBtn">Clear the wall</button></div>
   </div>
+  <div class="section" data-for="field">
+    <div class="row">
+      <button data-field="scatter">Scatter</button>
+      <button data-field="gather">Gather</button>
+    </div>
+    <label class="slider">Dots <input data-key="dots" type="range" min="0.3" max="2" step="0.1"><span></span></label>
+    <label class="slider">Push <input data-key="push" type="range" min="0.2" max="2" step="0.1"><span></span></label>
+    <label class="slider">Return <input data-key="springBack" type="range" min="0" max="2" step="0.1"><span></span></label>
+  </div>
   <div class="section" data-for="partner">
     <label class="slider">Delay (sec) <input data-key="delay" type="range" min="0.1" max="3" step="0.05"><span></span></label>
     <label class="slider">Shift <input data-key="shift" type="range" min="-0.5" max="0.5" step="0.01"><span></span></label>
@@ -123,13 +146,13 @@
   </div>
 
   <details>
-    <summary><span class="label">Edges and setup</span></summary>
+    <summary><span class="label">Fine-tune and setup</span></summary>
     <div class="section">
       <label class="slider">Smoothness <input data-key="smooth" type="range" min="0" max="8" step="0.5"><span></span></label>
       <label class="slider">Steadiness <input data-key="steady" type="range" min="0" max="0.85" step="0.05"><span></span></label>
       <label class="slider">Stickiness <input data-key="sticky" type="range" min="0" max="0.45" step="0.05"><span></span></label>
       <label class="slider">Speck cleanup <input data-key="cleanup" type="range" min="0" max="0.5" step="0.01"><span></span></label>
-      <label class="slider">Arm fill <input data-key="limbs" type="range" min="0" max="1.6" step="0.1"><span></span></label>
+      <label class="slider" id="limbsRow">Arm fill <input data-key="limbs" type="range" min="0" max="1.6" step="0.1"><span></span></label>
       <label class="slider">Cutoff <input data-key="cutoff" type="range" min="0.25" max="0.75" step="0.01"><span></span></label>
       <label class="slider">Softness <input data-key="soft" type="range" min="0" max="0.2" step="0.01"><span></span></label>
       <label class="slider">Glow <input data-key="glow" type="range" min="0" max="1" step="0.05"><span></span></label>
@@ -159,7 +182,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v7";
+const APP_VERSION = "v8";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -176,7 +199,7 @@ const MODELS = {
     url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
   },
   quality: {
-    label: "Selfie HQ", kind: "seg", invert: true, // channel 0 = background
+    label: "HQ (slow)", kind: "seg", invert: true, // channel 0 = background
     url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
   }
 };
@@ -188,6 +211,8 @@ const DEFAULTS = {
   mode: "shadow",
   smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
   sticky: 0.3, cleanup: 0.15, limbs: 1, follow: true,
+  look: "smooth",
+  fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
   paintFade: 0.15, hueSpeed: 0.35,
@@ -195,6 +220,15 @@ const DEFAULTS = {
   mirror: true, facingMode: "user", model: "fast", engine: "gpu"
 };
 const STORE_KEY = "shadow-partner-settings-v4";
+// Looks: tested combinations of the edge sliders that each feel clearly different.
+const LOOKS = {
+  crisp:  { smooth: 1.5, steady: 0.1,  sticky: 0.1,  cutoff: 0.5,  soft: 0,    glow: 0 },   // sharp, instant, a bit jittery
+  smooth: { smooth: 3,   steady: 0.25, sticky: 0.3,  cutoff: 0.45, soft: 0,    glow: 0 },   // the default balance
+  calm:   { smooth: 3.5, steady: 0.65, sticky: 0.45, cutoff: 0.45, soft: 0.02, glow: 0 },   // steadiest, lags a little
+  bold:   { smooth: 5,   steady: 0.35, sticky: 0.35, cutoff: 0.3,  soft: 0,    glow: 0 },   // fuller, rounder figure
+  dreamy: { smooth: 6,   steady: 0.5,  sticky: 0.3,  cutoff: 0.45, soft: 0.1,  glow: 0.8 }  // soft and glowing
+};
+const LOOK_KEYS = ["smooth", "steady", "sticky", "cutoff", "soft", "glow"];
 let S = { ...DEFAULTS };
 try { Object.assign(S, JSON.parse(localStorage.getItem(STORE_KEY) || "{}")); } catch (e) {}
 if (!MODELS[S.model]) S.model = "fast";
@@ -574,7 +608,49 @@ function processMask(p, w, h, poses, rect) {
   gl.bindTexture(gl.TEXTURE_2D, cropTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, cropBytes);
   run("place", rawFull, (a) => { a.tex("u_crop", cropTex); a.f("u_rect", rect.x, rect.y, rect.w, rect.h); });
+  if (S.mode === "field") buildGrid(cropBytes, w, h, rect);
   updateRoi(bx1 >= 0 ? { x0: bx0, x1: bx1, y0: by0, y1: by1 } : null, w, h, rect);
+}
+
+// Coarse body map in full-frame coordinates, for the Field dots (CPU side).
+const GRID_LONG = 96;
+let gridW = 0, gridH = 0, grid = null, gridTmp = null, gridHasBody = false, gridCx = 0.5, gridCy = 0.5;
+function buildGrid(bytes, w, h, rect) {
+  const gw = fullW >= fullH ? GRID_LONG : Math.round(GRID_LONG * fullW / fullH);
+  const gh = fullW >= fullH ? Math.round(GRID_LONG * fullH / fullW) : GRID_LONG;
+  if (gw !== gridW || gh !== gridH) { gridW = gw; gridH = gh; grid = new Float32Array(gw * gh); gridTmp = new Float32Array(gw * gh); }
+  let sum = 0, sx = 0, sy = 0;
+  for (let gy = 0; gy < gh; gy++) {
+    const v = (gy + 0.5) / gh, cy = Math.floor((v - rect.y) / rect.h * h);
+    for (let gx = 0; gx < gw; gx++) {
+      const u = (gx + 0.5) / gw, cx = Math.floor((u - rect.x) / rect.w * w);
+      const val = (cx >= 0 && cx < w && cy >= 0 && cy < h) ? bytes[cy * w + cx] / 255 : 0;
+      const i = gy * gw + gx;
+      grid[i] = grid[i] * 0.4 + val * 0.6;           // a little steadiness
+      if (val > 0.5) { sum++; sx += u; sy += v; }
+    }
+  }
+  gridHasBody = sum > 3;
+  if (gridHasBody) { gridCx = sx / sum; gridCy = sy / sum; }
+}
+// Blurred copy so the push reaches a little outside the body.
+let gridSoft = null;
+function blurGrid() {
+  const w = gridW, h = gridH, R = 3;
+  if (!gridSoft || gridSoft.length !== grid.length) gridSoft = new Float32Array(grid.length);
+  for (let pass = 0; pass < 2; pass++) {
+    const src = pass === 0 ? grid : gridSoft;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let a = 0, c = 0;
+      for (let k = -R; k <= R; k++) { const xx = x + k; if (xx >= 0 && xx < w) { a += src[y * w + xx]; c++; } }
+      gridTmp[y * w + x] = a / c;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let a = 0, c = 0;
+      for (let k = -R; k <= R; k++) { const yy = y + k; if (yy >= 0 && yy < h) { a += gridTmp[yy * w + x]; c++; } }
+      gridSoft[y * w + x] = a / c;
+    }
+  }
 }
 
 // Follow the dancer: aim the crop at the body with a margin, zoom out fast when a
@@ -670,6 +746,118 @@ function fitRect() {
   return [(1 - w) / 2, (1 - h) / 2, w, h];
 }
 
+// ---------------- Field: dots that react to the body ----------------
+const POINT_VS = `
+attribute vec2 a_pos; attribute float a_speed;
+uniform float u_size; varying float v_s;
+void main() { v_s = a_speed; gl_PointSize = u_size * (1.0 + a_speed * 1.6); gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+const POINT_FS = `
+precision mediump float; varying float v_s; uniform float u_invert;
+void main() {
+  float a = smoothstep(0.5, 0.25, length(gl_PointCoord - 0.5));
+  float s = clamp(v_s, 0.0, 1.0);
+  vec3 rest = vec3(0.5, 0.66, 1.0) * 0.75;
+  vec3 hot = mix(vec3(0.6, 0.85, 1.0), vec3(1.0, 0.55, 0.8), smoothstep(0.3, 1.0, s));
+  vec3 c = mix(rest, hot, smoothstep(0.02, 0.5, s)) * (0.7 + 0.8 * s);
+  gl_FragColor = vec4(c * a, 1.0);
+}`;
+const pointProg = (() => {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, POINT_VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, POINT_FS));
+  gl.bindAttribLocation(p, 0, "a_pos"); gl.bindAttribLocation(p, 1, "a_speed");
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return { p, size: gl.getUniformLocation(p, "u_size") };
+})();
+const pointBuf = gl.createBuffer();
+let dotN = 0, dotHome = null, dotPos = null, dotVel = null, dotGL = null, dotsFor = "", lastSim = 0;
+
+function initDots() {
+  const W = stage.width, H = stage.height;
+  dotN = Math.round(2600 * S.dots);
+  const spacing = Math.sqrt((W * H) / dotN);
+  const cols = Math.ceil(W / spacing), rows = Math.ceil(H / spacing);
+  dotN = cols * rows;
+  dotHome = new Float32Array(dotN * 2); dotPos = new Float32Array(dotN * 2); dotVel = new Float32Array(dotN * 2);
+  dotGL = new Float32Array(dotN * 3);
+  let i = 0;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++, i++) {
+    const x = (c + 0.5 + (Math.random() - 0.5) * 0.6) * spacing, y = (r + 0.5 + (Math.random() - 0.5) * 0.6) * spacing;
+    dotHome[2 * i] = dotPos[2 * i] = x; dotHome[2 * i + 1] = dotPos[2 * i + 1] = y;
+  }
+  dotsFor = `${W}x${H}x${S.dots}`;
+}
+
+// Body value at a screen pixel (0..1), using the same placement as the shaders.
+function bodyAt(sx, sy, fit) {
+  if (!gridSoft) return 0;
+  let fu = (sx / stage.width - fit[0]) / fit[2], fv = (sy / stage.height - fit[1]) / fit[3];
+  if (fu < 0 || fu > 1 || fv < 0 || fv > 1) return 0;
+  if (S.mirror) fu = 1 - fu;
+  const gx = Math.min(gridW - 1.001, Math.max(0, fu * gridW - 0.5)), gy = Math.min(gridH - 1.001, Math.max(0, fv * gridH - 0.5));
+  const x0 = gx | 0, y0 = gy | 0, tx = gx - x0, ty = gy - y0, i = y0 * gridW + x0;
+  const a = gridSoft[i], b = gridSoft[i + 1], c = gridSoft[i + gridW], d = gridSoft[i + gridW + 1];
+  return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
+}
+
+function stepDots(now, fit) {
+  if (dotsFor !== `${stage.width}x${stage.height}x${S.dots}`) initDots();
+  const dt = Math.min(0.1, Math.max(0.001, (now - (lastSim || now - 33)) / 1000)); lastSim = now;
+  if (gridW) blurGrid();
+  const W = stage.width;
+  const cellPx = (fit[2] * W) / Math.max(1, gridW);
+  const h = cellPx * 1.5;
+  const gather = S.fieldMode === "gather";
+  const pushA = S.push * W * (gather ? 14 : 30);           // px/s² per unit slope
+  const spring = (gather ? 0.8 : 3.5) * S.springBack;       // 1/s² pull back home
+  const damp = Math.exp(-(gather ? 3.2 : 2.4) * dt);
+  // body centre on screen, to push dots out of the middle of the body
+  let bcx = (S.mirror ? 1 - gridCx : gridCx) * fit[2] * W + fit[0] * W, bcy = (gridCy * fit[3] + fit[1]) * stage.height;
+  const norm = 1 / (W * 0.6);
+  for (let i = 0; i < dotN; i++) {
+    const ix = 2 * i, iy = ix + 1;
+    let x = dotPos[ix], y = dotPos[iy], vx = dotVel[ix], vy = dotVel[iy];
+    let ax = (dotHome[ix] - x) * spring, ay = (dotHome[iy] - y) * spring;
+    if (gridHasBody) {
+      const c = bodyAt(x, y, fit);
+      if (c > 0.01) {
+        const gx = (bodyAt(x + h, y, fit) - bodyAt(x - h, y, fit)) * 0.5;
+        const gy = (bodyAt(x, y + h, fit) - bodyAt(x, y - h, fit)) * 0.5;
+        const sgn = gather ? 1 : -1;
+        ax += sgn * gx * pushA; ay += sgn * gy * pushA;
+        if (!gather && c > 0.55) {          // deep inside the body: shove outward from its centre
+          let dx = x - bcx, dy = y - bcy; const d = Math.hypot(dx, dy) || 1;
+          ax += (dx / d) * pushA * 0.08 * c; ay += (dy / d) * pushA * 0.08 * c;
+        }
+      }
+    }
+    vx = (vx + ax * dt) * damp; vy = (vy + ay * dt) * damp;
+    x += vx * dt; y += vy * dt;
+    dotPos[ix] = x; dotPos[iy] = y; dotVel[ix] = vx; dotVel[iy] = vy;
+    const k = 3 * i;
+    dotGL[k] = (x / W) * 2 - 1; dotGL[k + 1] = 1 - (y / stage.height) * 2;
+    dotGL[k + 2] = Math.min(1.5, Math.hypot(vx, vy) * norm);
+  }
+}
+
+function drawDots() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, stage.width, stage.height);
+  gl.useProgram(pointProg.p);
+  gl.uniform1f(pointProg.size, Math.max(2, 2.6 * pixelRatio * Math.sqrt(1 / S.dots)));
+  gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, dotGL, gl.DYNAMIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 12, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 12, 8);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.drawArrays(gl.POINTS, 0, dotN);
+  gl.disable(gl.BLEND);
+  gl.disableVertexAttribArray(1);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+}
+
 let startTime = performance.now();
 let paintFrame = 0;
 function render(now) {
@@ -685,6 +873,10 @@ function render(now) {
 
   if (S.mode === "shadow") {
     run("shadow", null, common);
+  } else if (S.mode === "field") {
+    run("shadow", null, common);
+    stepDots(now, fit);
+    drawDots();
   } else if (S.mode === "trails" || S.mode === "paint") {
     const trails = S.mode === "trails";
     // decay per frame: trails fade within ~0.2–4 s; paint lingers or stays forever
@@ -930,6 +1122,10 @@ function syncUI() {
     inp.nextElementSibling.textContent = fmt(inp.dataset.key, +S[inp.dataset.key]);
   });
   $("mirrorBtn").classList.toggle("on", S.mirror);
+  document.querySelectorAll("#looks button").forEach((b) => b.classList.toggle("on", b.dataset.look === S.look));
+  $("lookNote").textContent = S.look === "custom" ? "· custom (fine-tuned)" : "";
+  document.querySelectorAll("[data-field]").forEach((b) => b.classList.toggle("on", b.dataset.field === S.fieldMode));
+  $("limbsRow").style.display = S.model === "body" ? "" : "none";
   document.querySelectorAll("#styles button[data-style]").forEach((b) => b.classList.toggle("on", b.dataset.style === S.style));
   $("invertBtn").classList.toggle("on", S.invert);
   $("fillBtn").classList.toggle("on", S.fill);
@@ -946,8 +1142,13 @@ document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("cl
   S.mode = b.dataset.mode; save(); syncUI();
   if (S.mode === "trails" || S.mode === "paint") clearFeedback();
 }));
+document.querySelectorAll("#looks button").forEach((b) => b.addEventListener("click", () => {
+  Object.assign(S, LOOKS[b.dataset.look]); S.look = b.dataset.look; save(); syncUI();
+}));
+document.querySelectorAll("[data-field]").forEach((b) => b.addEventListener("click", () => { S.fieldMode = b.dataset.field; save(); syncUI(); }));
 document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListener("input", () => {
   S[inp.dataset.key] = parseFloat(inp.value);
+  if (LOOK_KEYS.includes(inp.dataset.key) && S.look !== "custom") { S.look = "custom"; syncUI(); }
   inp.nextElementSibling.textContent = fmt(inp.dataset.key, S[inp.dataset.key]);
   save();
 }));
