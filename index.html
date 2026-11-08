@@ -48,6 +48,9 @@
   #controls.show { display: flex; }
   .modes, .styles, .looks { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .modes, .looks { grid-template-columns: repeat(5, 1fr); }
+  .worlds { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .worlds button { font-size: 12px; padding: 9px 2px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d0d; color: var(--fg); }
+  .worlds button.on { border-color: var(--fg); background: #222; }
   .modes button, .looks button { font-size: 12px !important; padding: 9px 2px !important; }
   .styles button { font-size: 12px !important; padding: 8px 4px !important; }
   .modes button, .styles button, .looks button, .row button {
@@ -131,13 +134,24 @@
     <div class="row"><button id="clearBtn">Clear the wall</button></div>
   </div>
   <div class="section" data-for="field">
-    <div class="row">
+    <div class="worlds" id="worlds">
+      <button data-world="dots">Dots</button>
+      <button data-world="web">Web</button>
+      <button data-world="sparks">Sparks</button>
+      <button data-world="snow">Snow</button>
+      <button data-world="ripples">Ripples</button>
+      <button data-world="wind">Wind</button>
+      <button data-world="strings">Strings</button>
+      <button data-world="ink">Ink</button>
+    </div>
+    <div class="row" id="scatterRow">
       <button data-field="scatter">Scatter</button>
       <button data-field="gather">Gather</button>
     </div>
-    <label class="slider">Dots <input data-key="dots" type="range" min="0.3" max="2" step="0.1"><span></span></label>
-    <label class="slider">Push <input data-key="push" type="range" min="0.2" max="2" step="0.1"><span></span></label>
-    <label class="slider">Return <input data-key="springBack" type="range" min="0" max="2" step="0.1"><span></span></label>
+    <label class="slider" id="amountRow">Amount <input data-key="dots" type="range" min="0.3" max="2" step="0.1"><span></span></label>
+    <label class="slider">Strength <input data-key="push" type="range" min="0.2" max="2" step="0.1"><span></span></label>
+    <label class="slider" id="returnRow"><span id="returnLabel">Return</span> <input data-key="springBack" type="range" min="0" max="2" step="0.1"><span></span></label>
+    <div class="row" id="clearWorldRow"><button id="clearWorldBtn">Start over</button></div>
   </div>
   <div class="section" data-for="partner">
     <label class="slider">Delay (sec) <input data-key="delay" type="range" min="0.1" max="3" step="0.05"><span></span></label>
@@ -182,7 +196,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v8";
+const APP_VERSION = "v9";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -212,7 +226,7 @@ const DEFAULTS = {
   smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
   sticky: 0.3, cleanup: 0.15, limbs: 1, follow: true,
   look: "smooth",
-  fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
+  world: "dots", fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
   paintFade: 0.15, hueSpeed: 0.35,
@@ -305,6 +319,8 @@ vec3 hue(float h) {
 }`;
 
 const SHADERS = {
+  fade: `precision mediump float; varying vec2 v_uv; uniform sampler2D u_prev; uniform float u_decay;
+    void main() { vec3 p = texture2D(u_prev, v_uv).rgb; gl_FragColor = vec4(max(p * u_decay - vec3(1.5 / 255.0), 0.0), 1.0); }`,
   // Put the model's mask (made from a zoomed-in crop) back where it belongs in the full frame.
   place: `precision mediump float; varying vec2 v_uv;
     uniform sampler2D u_crop; uniform vec4 u_rect;
@@ -365,6 +381,27 @@ const SHADERS = {
       vec3 paint = texture2D(u_buf, v_uv).rgb;
       float line = outline(f);
       vec3 c = mix(paint, vec3(1.0), line * 0.95) + vec3(1.0) * halo(f) * 0.5;
+      gl_FragColor = finish(c); }`,
+  // Field worlds drawn behind the figure: a color texture (ink, trails) or a water height map (ripples).
+  compose: COMMON + `
+    uniform sampler2D u_field; uniform sampler2D u_bg; uniform float u_bgMode; uniform float u_flipY; uniform vec2 u_texel;
+    void main() {
+      vec2 q = vec2(v_uv.x, u_flipY > 0.5 ? 1.0 - v_uv.y : v_uv.y);
+      vec3 bg;
+      if (u_bgMode < 0.5) bg = texture2D(u_bg, q).rgb;
+      else {
+        float hL = texture2D(u_bg, q - vec2(u_texel.x, 0.0)).r, hR = texture2D(u_bg, q + vec2(u_texel.x, 0.0)).r;
+        float hU = texture2D(u_bg, q - vec2(0.0, u_texel.y)).r, hD = texture2D(u_bg, q + vec2(0.0, u_texel.y)).r;
+        vec2 sl = vec2(hR - hL, hD - hU) * 7.0;
+        vec3 n = normalize(vec3(-sl.x, -sl.y, 1.0));
+        float light = dot(n, normalize(vec3(-0.5, -0.6, 0.65)));
+        float spec = pow(max(dot(n, normalize(vec3(-0.35, -0.45, 0.82))), 0.0), 60.0);
+        float slope = length(sl);
+        bg = vec3(0.01, 0.03, 0.07) + vec3(0.15, 0.4, 0.75) * clamp(slope * 1.6, 0.0, 1.0) * (0.5 + 0.5 * light)
+           + vec3(0.9, 0.97, 1.0) * spec * min(1.0, slope * 6.0);
+      }
+      float f = fieldAt(u_field, v_uv); float b = body(f);
+      vec3 c = mix(bg * (1.0 - b), vec3(1.0), figure(f)) + vec3(0.75, 0.85, 1.0) * halo(f) * (1.0 - b);
       gl_FragColor = finish(c); }`,
   partner: COMMON + `
     uniform sampler2D u_field; uniform sampler2D u_past;
@@ -608,7 +645,7 @@ function processMask(p, w, h, poses, rect) {
   gl.bindTexture(gl.TEXTURE_2D, cropTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, cropBytes);
   run("place", rawFull, (a) => { a.tex("u_crop", cropTex); a.f("u_rect", rect.x, rect.y, rect.w, rect.h); });
-  if (S.mode === "field") buildGrid(cropBytes, w, h, rect);
+  if (S.mode === "field") { buildGrid(cropBytes, w, h, rect); blurGrid(); }
   updateRoi(bx1 >= 0 ? { x0: bx0, x1: bx1, y0: by0, y1: by1 } : null, w, h, rect);
 }
 
@@ -634,10 +671,11 @@ function buildGrid(bytes, w, h, rect) {
   if (gridHasBody) { gridCx = sx / sum; gridCy = sy / sum; }
 }
 // Blurred copy so the push reaches a little outside the body.
-let gridSoft = null;
+let gridSoft = null, gridPrev = null;
 function blurGrid() {
   const w = gridW, h = gridH, R = 3;
-  if (!gridSoft || gridSoft.length !== grid.length) gridSoft = new Float32Array(grid.length);
+  if (!gridSoft || gridSoft.length !== grid.length) { gridSoft = new Float32Array(grid.length); gridPrev = new Float32Array(grid.length); }
+  else gridPrev.set(gridSoft);   // last frame's body, for motion
   for (let pass = 0; pass < 2; pass++) {
     const src = pass === 0 ? grid : gridSoft;
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -746,78 +784,149 @@ function fitRect() {
   return [(1 - w) / 2, (1 - h) / 2, w, h];
 }
 
-// ---------------- Field: dots that react to the body ----------------
+// ---------------- Field: interactive worlds ----------------
+// Every world reads the same body map (gridSoft = now, gridPrev = last frame) and a
+// motion estimate (which way and how fast the body edge is moving at a point).
+const WORLD_LIST = ["dots", "web", "sparks", "snow", "ripples", "wind", "strings", "ink"];
+
 const POINT_VS = `
 attribute vec2 a_pos; attribute float a_speed;
-uniform float u_size; varying float v_s;
-void main() { v_s = a_speed; gl_PointSize = u_size * (1.0 + a_speed * 1.6); gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+uniform float u_size; uniform float u_grow; varying float v_s;
+void main() { v_s = a_speed; gl_PointSize = u_size * (1.0 + clamp(a_speed, 0.0, 1.5) * u_grow); gl_Position = vec4(a_pos, 0.0, 1.0); }`;
 const POINT_FS = `
-precision mediump float; varying float v_s; uniform float u_invert;
+precision mediump float; varying float v_s; uniform float u_palette;
 void main() {
-  float a = smoothstep(0.5, 0.25, length(gl_PointCoord - 0.5));
-  float s = clamp(v_s, 0.0, 1.0);
-  vec3 rest = vec3(0.5, 0.66, 1.0) * 0.75;
-  vec3 hot = mix(vec3(0.6, 0.85, 1.0), vec3(1.0, 0.55, 0.8), smoothstep(0.3, 1.0, s));
-  vec3 c = mix(rest, hot, smoothstep(0.02, 0.5, s)) * (0.7 + 0.8 * s);
+  float a = smoothstep(0.5, 0.22, length(gl_PointCoord - 0.5));
+  float s = v_s; vec3 c;
+  if (u_palette < 0.5) {            // dots: cool at rest, hot when moving
+    float k = clamp(s, 0.0, 1.0);
+    vec3 rest = vec3(0.5, 0.66, 1.0) * 0.75;
+    vec3 hot = mix(vec3(0.6, 0.85, 1.0), vec3(1.0, 0.55, 0.8), smoothstep(0.3, 1.0, k));
+    c = mix(rest, hot, smoothstep(0.02, 0.5, k)) * (0.7 + 0.8 * k);
+  } else if (u_palette < 1.5) {     // sparks: s = life left
+    float l = clamp(s, 0.0, 1.0);
+    vec3 warm = mix(vec3(1.0, 0.5, 0.12), vec3(1.0, 0.95, 0.8), smoothstep(0.65, 1.0, l));
+    c = mix(vec3(0.5, 0.08, 0.02), warm, smoothstep(0.0, 0.5, l)) * (0.35 + 1.1 * l);
+  } else if (u_palette < 2.5) {     // snow / petals: s = alpha, +2 for petals
+    float petal = step(1.5, s); float al = clamp(s - 2.0 * petal, 0.0, 1.0);
+    c = mix(vec3(0.88, 0.93, 1.0), vec3(1.0, 0.62, 0.78), petal) * al;
+  } else if (u_palette < 3.5) {     // wind: s = speed
+    float l = clamp(s, 0.0, 1.0);
+    c = mix(vec3(0.12, 0.3, 0.55), vec3(0.8, 0.97, 1.0), l) * (0.4 + 0.9 * l);
+  } else {                          // strings / web: s = brightness
+    float l = clamp(s, 0.0, 1.5);
+    c = mix(vec3(0.3, 0.45, 0.85), vec3(1.0, 0.96, 1.0), clamp(l - 0.2, 0.0, 1.0)) * (0.3 + 0.75 * l);
+  }
   gl_FragColor = vec4(c * a, 1.0);
 }`;
-const pointProg = (() => {
+const LINE_FS = `
+precision mediump float; varying float v_s;
+void main() { gl_FragColor = vec4(vec3(0.55, 0.75, 1.0) * v_s, 1.0); }`;
+const LINE_VS = `
+attribute vec2 a_pos; attribute float a_speed; varying float v_s;
+void main() { v_s = a_speed; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+function linkProgram(vsSrc, fsSrc) {
   const p = gl.createProgram();
-  gl.attachShader(p, compile(gl.VERTEX_SHADER, POINT_VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, POINT_FS));
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
   gl.bindAttribLocation(p, 0, "a_pos"); gl.bindAttribLocation(p, 1, "a_speed");
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  return { p, size: gl.getUniformLocation(p, "u_size") };
-})();
-const pointBuf = gl.createBuffer();
-let dotN = 0, dotHome = null, dotPos = null, dotVel = null, dotGL = null, dotsFor = "", lastSim = 0;
-
-function initDots() {
-  const W = stage.width, H = stage.height;
-  dotN = Math.round(2600 * S.dots);
-  const spacing = Math.sqrt((W * H) / dotN);
-  const cols = Math.ceil(W / spacing), rows = Math.ceil(H / spacing);
-  dotN = cols * rows;
-  dotHome = new Float32Array(dotN * 2); dotPos = new Float32Array(dotN * 2); dotVel = new Float32Array(dotN * 2);
-  dotGL = new Float32Array(dotN * 3);
-  let i = 0;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++, i++) {
-    const x = (c + 0.5 + (Math.random() - 0.5) * 0.6) * spacing, y = (r + 0.5 + (Math.random() - 0.5) * 0.6) * spacing;
-    dotHome[2 * i] = dotPos[2 * i] = x; dotHome[2 * i + 1] = dotPos[2 * i + 1] = y;
-  }
-  dotsFor = `${W}x${H}x${S.dots}`;
+  return p;
 }
+const pointProg = linkProgram(POINT_VS, POINT_FS);
+const pointU = { size: gl.getUniformLocation(pointProg, "u_size"), grow: gl.getUniformLocation(pointProg, "u_grow"), palette: gl.getUniformLocation(pointProg, "u_palette") };
+const lineProg = linkProgram(LINE_VS, LINE_FS);
+const vtxBuf = gl.createBuffer();
 
-// Body value at a screen pixel (0..1), using the same placement as the shaders.
-function bodyAt(sx, sy, fit) {
-  if (!gridSoft) return 0;
+// data: Float32Array of (x, y, value) in clip space
+function drawVerts(target, prog, mode, data, count, setup) {
+  if (!count) return;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fb : null);
+  gl.viewport(0, 0, stage.width, stage.height);
+  gl.useProgram(prog);
+  setup && setup();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vtxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, count * 3), gl.DYNAMIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 12, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 12, 8);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.drawArrays(mode, 0, count);
+  gl.disable(gl.BLEND);
+  gl.disableVertexAttribArray(1);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+}
+function drawPoints(target, data, count, size, palette, grow = 0) {
+  drawVerts(target, pointProg, gl.POINTS, data, count, () => {
+    gl.uniform1f(pointU.size, size); gl.uniform1f(pointU.grow, grow); gl.uniform1f(pointU.palette, palette);
+  });
+}
+function drawLines(target, data, count) { drawVerts(target, lineProg, gl.LINES, data, count, null); }
+const cx = (x) => (x / stage.width) * 2 - 1, cy = (y) => 1 - (y / stage.height) * 2;
+
+// ---- body map helpers ----
+function bodyAt(sx, sy, fit, arr) {
+  arr = arr || gridSoft;
+  if (!arr) return 0;
   let fu = (sx / stage.width - fit[0]) / fit[2], fv = (sy / stage.height - fit[1]) / fit[3];
   if (fu < 0 || fu > 1 || fv < 0 || fv > 1) return 0;
   if (S.mirror) fu = 1 - fu;
   const gx = Math.min(gridW - 1.001, Math.max(0, fu * gridW - 0.5)), gy = Math.min(gridH - 1.001, Math.max(0, fv * gridH - 0.5));
   const x0 = gx | 0, y0 = gy | 0, tx = gx - x0, ty = gy - y0, i = y0 * gridW + x0;
-  const a = gridSoft[i], b = gridSoft[i + 1], c = gridSoft[i + gridW], d = gridSoft[i + gridW + 1];
+  const a = arr[i], b = arr[i + 1], c = arr[i + gridW], d = arr[i + gridW + 1];
   return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
 }
+function frameToScreen(u, v, fit) {
+  return [(fit[0] + (S.mirror ? 1 - u : u) * fit[2]) * stage.width, (fit[1] + v * fit[3]) * stage.height];
+}
+// Motion of the body edge at a screen point, in px/s (null if nothing is moving there).
+// Edge speed = change over time / steepness of the edge, along the edge's direction.
+function motionAt(x, y, fit, h) {
+  if (!gridPrev) return null;
+  const c = bodyAt(x, y, fit, gridSoft), p = bodyAt(x, y, fit, gridPrev), db = c - p;
+  if (Math.abs(db) < 0.02) return null;
+  const gx = (bodyAt(x + h, y, fit, gridSoft) - bodyAt(x - h, y, fit, gridSoft) + bodyAt(x + h, y, fit, gridPrev) - bodyAt(x - h, y, fit, gridPrev)) / (4 * h);
+  const gy = (bodyAt(x, y + h, fit, gridSoft) - bodyAt(x, y - h, fit, gridSoft) + bodyAt(x, y + h, fit, gridPrev) - bodyAt(x, y - h, fit, gridPrev)) / (4 * h);
+  const g2 = gx * gx + gy * gy;
+  if (g2 < 1e-9) return null;
+  let vx = (-db * gx) / g2, vy = (-db * gy) / g2;
+  const m = Math.hypot(vx, vy), cap = stage.width * 0.08;
+  if (m > cap) { vx *= cap / m; vy *= cap / m; }
+  return { db, vx: vx / frameDt, vy: vy / frameDt };
+}
 
-function stepDots(now, fit) {
-  if (dotsFor !== `${stage.width}x${stage.height}x${S.dots}`) initDots();
-  const dt = Math.min(0.1, Math.max(0.001, (now - (lastSim || now - 33)) / 1000)); lastSim = now;
-  if (gridW) blurGrid();
-  const W = stage.width;
-  const cellPx = (fit[2] * W) / Math.max(1, gridW);
-  const h = cellPx * 1.5;
+let frameDt = 1 / 20, lastFrameT = 0, W_ = null, worldKey = "";
+const rand = Math.random;
+
+// =============== Dots (Scatter / Gather) ===============
+function initDots() {
+  const W = stage.width, H = stage.height;
+  let n = Math.round(2600 * S.dots);
+  const spacing = Math.sqrt((W * H) / n), cols = Math.ceil(W / spacing), rows = Math.ceil(H / spacing);
+  n = cols * rows;
+  const st = { n, home: new Float32Array(n * 2), pos: new Float32Array(n * 2), vel: new Float32Array(n * 2), gl: new Float32Array(n * 3) };
+  let i = 0;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++, i++) {
+    const x = (c + 0.5 + (rand() - 0.5) * 0.6) * spacing, y = (r + 0.5 + (rand() - 0.5) * 0.6) * spacing;
+    st.home[2 * i] = st.pos[2 * i] = x; st.home[2 * i + 1] = st.pos[2 * i + 1] = y;
+  }
+  return st;
+}
+function stepDots(st, fit) {
+  const W = stage.width, dt = frameDt;
+  const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.5;
   const gather = S.fieldMode === "gather";
-  const pushA = S.push * W * (gather ? 14 : 30);           // px/s² per unit slope
-  const spring = (gather ? 0.8 : 3.5) * S.springBack;       // 1/s² pull back home
+  const pushA = S.push * W * (gather ? 14 : 30);
+  const spring = (gather ? 0.8 : 3.5) * S.springBack;
   const damp = Math.exp(-(gather ? 3.2 : 2.4) * dt);
-  // body centre on screen, to push dots out of the middle of the body
-  let bcx = (S.mirror ? 1 - gridCx : gridCx) * fit[2] * W + fit[0] * W, bcy = (gridCy * fit[3] + fit[1]) * stage.height;
+  const [bcx, bcy] = frameToScreen(gridCx, gridCy, fit);
   const norm = 1 / (W * 0.6);
-  for (let i = 0; i < dotN; i++) {
+  for (let i = 0; i < st.n; i++) {
     const ix = 2 * i, iy = ix + 1;
-    let x = dotPos[ix], y = dotPos[iy], vx = dotVel[ix], vy = dotVel[iy];
-    let ax = (dotHome[ix] - x) * spring, ay = (dotHome[iy] - y) * spring;
+    let x = st.pos[ix], y = st.pos[iy], vx = st.vel[ix], vy = st.vel[iy];
+    let ax = (st.home[ix] - x) * spring, ay = (st.home[iy] - y) * spring;
     if (gridHasBody) {
       const c = bodyAt(x, y, fit);
       if (c > 0.01) {
@@ -825,37 +934,392 @@ function stepDots(now, fit) {
         const gy = (bodyAt(x, y + h, fit) - bodyAt(x, y - h, fit)) * 0.5;
         const sgn = gather ? 1 : -1;
         ax += sgn * gx * pushA; ay += sgn * gy * pushA;
-        if (!gather && c > 0.55) {          // deep inside the body: shove outward from its centre
-          let dx = x - bcx, dy = y - bcy; const d = Math.hypot(dx, dy) || 1;
+        if (!gather && c > 0.55) {
+          const dx = x - bcx, dy = y - bcy, d = Math.hypot(dx, dy) || 1;
           ax += (dx / d) * pushA * 0.08 * c; ay += (dy / d) * pushA * 0.08 * c;
         }
       }
     }
     vx = (vx + ax * dt) * damp; vy = (vy + ay * dt) * damp;
     x += vx * dt; y += vy * dt;
-    dotPos[ix] = x; dotPos[iy] = y; dotVel[ix] = vx; dotVel[iy] = vy;
+    st.pos[ix] = x; st.pos[iy] = y; st.vel[ix] = vx; st.vel[iy] = vy;
     const k = 3 * i;
-    dotGL[k] = (x / W) * 2 - 1; dotGL[k + 1] = 1 - (y / stage.height) * 2;
-    dotGL[k + 2] = Math.min(1.5, Math.hypot(vx, vy) * norm);
+    st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = Math.min(1.5, Math.hypot(vx, vy) * norm);
   }
+  drawPoints(null, st.gl, st.n, Math.max(2, 2.6 * pixelRatio * Math.sqrt(1 / S.dots)), 0, 1.6);
 }
 
-function drawDots() {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, stage.width, stage.height);
-  gl.useProgram(pointProg.p);
-  gl.uniform1f(pointProg.size, Math.max(2, 2.6 * pixelRatio * Math.sqrt(1 / S.dots)));
-  gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, dotGL, gl.DYNAMIC_DRAW);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 12, 0);
-  gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 12, 8);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
-  gl.drawArrays(gl.POINTS, 0, dotN);
-  gl.disable(gl.BLEND);
-  gl.disableVertexAttribArray(1);
-  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+// =============== Web (constellation) ===============
+function initWeb() {
+  const W = stage.width, H = stage.height, n = Math.round(700 * S.dots);
+  const st = { n, pos: new Float32Array(n * 2), vel: new Float32Array(n * 2), lit: new Float32Array(n), gl: new Float32Array(n * 3), lines: new Float32Array(9000 * 2 * 3) };
+  for (let i = 0; i < n; i++) {
+    st.pos[2 * i] = rand() * W; st.pos[2 * i + 1] = rand() * H;
+    const a = rand() * 6.283, s = W * 0.015;
+    st.vel[2 * i] = Math.cos(a) * s; st.vel[2 * i + 1] = Math.sin(a) * s;
+  }
+  return st;
+}
+function stepWeb(st, fit) {
+  const W = stage.width, H = stage.height, dt = frameDt;
+  const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.5;
+  const D = W * (0.05 + 0.03 * S.push), D2 = D * D;
+  const ease = 1 - Math.exp(-dt * 6);
+  for (let i = 0; i < st.n; i++) {
+    const ix = 2 * i, iy = ix + 1;
+    let x = st.pos[ix], y = st.pos[iy];
+    const b = gridHasBody ? bodyAt(x, y, fit) : 0;
+    // brightest right at the body's edge, dark deep inside or far away
+    const target = b < 0.45 ? Math.min(1, Math.max(0, (b - 0.03) / 0.25)) : Math.max(0, (0.9 - b) / 0.45);
+    st.lit[i] += (target - st.lit[i]) * ease;
+    // drift, with a gentle pull toward the body edge when lit
+    let vx = st.vel[ix] + (rand() - 0.5) * W * 0.02 * dt, vy = st.vel[iy] + (rand() - 0.5) * W * 0.02 * dt;
+    if (b > 0.01) {   // drift toward the edge from either side
+      const gx = (bodyAt(x + h, y, fit) - bodyAt(x - h, y, fit)) * 0.5, gy = (bodyAt(x, y + h, fit) - bodyAt(x, y - h, fit)) * 0.5;
+      const want = Math.max(-1, Math.min(1, (0.35 - b) * 4));
+      vx += gx * W * 3 * dt * S.push * want; vy += gy * W * 3 * dt * S.push * want;
+    }
+    const sp = Math.hypot(vx, vy), maxS = W * 0.06;
+    if (sp > maxS) { vx *= maxS / sp; vy *= maxS / sp; }
+    x += vx * dt; y += vy * dt;
+    if (x < 0) x += W; if (x > W) x -= W; if (y < 0) y += H; if (y > H) y -= H;
+    st.pos[ix] = x; st.pos[iy] = y; st.vel[ix] = vx; st.vel[iy] = vy;
+    const k = 3 * i; st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = 0.25 + st.lit[i];
+  }
+  // connect nearby lit dots (spatial hash)
+  const cols = Math.ceil(W / D), rows = Math.ceil(H / D), buckets = new Map();
+  for (let i = 0; i < st.n; i++) {
+    if (st.lit[i] < 0.05) continue;
+    const key = Math.floor(st.pos[2 * i] / D) + Math.floor(st.pos[2 * i + 1] / D) * cols;
+    let b = buckets.get(key); if (!b) buckets.set(key, (b = [])); b.push(i);
+  }
+  let nv = 0; const L = st.lines, maxV = L.length / 3 - 2;
+  for (const [key, list] of buckets) {
+    const bx = key % cols, by = (key - bx) / cols;
+    for (let oy = 0; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+      if (oy === 0 && ox < 0) continue;
+      const other = buckets.get(bx + ox + (by + oy) * cols); if (!other) continue;
+      for (let a = 0; a < list.length; a++) {
+        const i = list[a];
+        for (let c = (other === list ? a + 1 : 0); c < other.length; c++) {
+          const j = other[c];
+          const dx = st.pos[2 * i] - st.pos[2 * j], dy = st.pos[2 * i + 1] - st.pos[2 * j + 1], d2 = dx * dx + dy * dy;
+          if (d2 > D2 || nv >= maxV) continue;
+          const al = Math.min(st.lit[i], st.lit[j]) * (1 - Math.sqrt(d2) / D) * 0.55;
+          if (al < 0.02) continue;
+          L[3 * nv] = cx(st.pos[2 * i]); L[3 * nv + 1] = cy(st.pos[2 * i + 1]); L[3 * nv + 2] = al; nv++;
+          L[3 * nv] = cx(st.pos[2 * j]); L[3 * nv + 1] = cy(st.pos[2 * j + 1]); L[3 * nv + 2] = al; nv++;
+        }
+      }
+    }
+  }
+  drawLines(null, L, nv);
+  drawPoints(null, st.gl, st.n, Math.max(2, 3 * pixelRatio), 4, 0.6);
+}
+
+// =============== Sparks (thrown off by fast movement) ===============
+function initSparks() {
+  const max = Math.round(2500 * S.dots);
+  return { max, n: 0, pos: new Float32Array(max * 2), vel: new Float32Array(max * 2), life: new Float32Array(max), span: new Float32Array(max), gl: new Float32Array(max * 3) };
+}
+function stepSparks(st, fit) {
+  const W = stage.width, H = stage.height, dt = frameDt;
+  // spawn at the leading edge of fast-moving body parts
+  if (gridHasBody && gridPrev) {
+    const cellX = (fit[2] * W) / gridW, cellY = (fit[3] * H) / gridH;
+    const minSpeed = (W * 0.32) / S.push;
+    for (let gy = 1; gy < gridH - 1; gy++) for (let gx = 1; gx < gridW - 1; gx++) {
+      const i = gy * gridW + gx, db = gridSoft[i] - gridPrev[i];
+      if (db < 0.06) continue;
+      const ggx = (gridSoft[i + 1] - gridSoft[i - 1] + gridPrev[i + 1] - gridPrev[i - 1]) / 4;
+      const ggy = (gridSoft[i + gridW] - gridSoft[i - gridW] + gridPrev[i + gridW] - gridPrev[i - gridW]) / 4;
+      const g2 = ggx * ggx + ggy * ggy; if (g2 < 1e-5) continue;
+      let vx = ((-db * ggx) / g2) * cellX / frameDt, vy = ((-db * ggy) / g2) * cellY / frameDt;
+      if (S.mirror) vx = -vx;
+      const sp = Math.hypot(vx, vy); if (sp < minSpeed) continue;
+      const cap = W * 3; if (sp > cap) { vx *= cap / sp; vy *= cap / sp; }
+      let count = Math.min(5, Math.floor((sp / minSpeed - 1) * 1.5 * S.dots + rand()));
+      const [px, py] = frameToScreen((gx + 0.5) / gridW, (gy + 0.5) / gridH, fit);
+      while (count-- > 0 && st.n < st.max) {
+        const k = st.n++;
+        st.pos[2 * k] = px + (rand() - 0.5) * cellX; st.pos[2 * k + 1] = py + (rand() - 0.5) * cellY;
+        st.vel[2 * k] = vx * (0.5 + rand() * 0.6) + (rand() - 0.5) * W * 0.25;
+        st.vel[2 * k + 1] = vy * (0.5 + rand() * 0.6) + (rand() - 0.5) * W * 0.25;
+        st.span[k] = st.life[k] = 0.6 + rand() * 0.9;
+      }
+    }
+  }
+  const g = H * 0.9, drag = Math.exp(-1.2 * dt);
+  let k = 0;
+  for (let i = 0; i < st.n; i++) {
+    let life = st.life[i] - dt; if (life <= 0) continue;
+    let vx = st.vel[2 * i] * drag, vy = (st.vel[2 * i + 1] + g * dt) * drag;
+    const x = st.pos[2 * i] + vx * dt, y = st.pos[2 * i + 1] + vy * dt;
+    if (y > H + 20) continue;
+    // compact the arrays as we go
+    st.pos[2 * k] = x; st.pos[2 * k + 1] = y; st.vel[2 * k] = vx; st.vel[2 * k + 1] = vy; st.life[k] = life; st.span[k] = st.span[i];
+    st.gl[3 * k] = cx(x); st.gl[3 * k + 1] = cy(y); st.gl[3 * k + 2] = life / st.span[k];
+    k++;
+  }
+  st.n = k;
+  fadeTrail(0.82);
+  drawPoints(fbB, st.gl, st.n, Math.max(2, 3.2 * pixelRatio), 1, 0.6);
+  swapTrail();
+}
+
+// =============== Snow / petals (land on the body, fly off with movement) ===============
+function initSnow() {
+  const W = stage.width, H = stage.height, n = Math.round(900 * S.dots);
+  const st = { n, pos: new Float32Array(n * 2), vel: new Float32Array(n * 2), rest: new Uint8Array(n), melt: new Float32Array(n), phase: new Float32Array(n), petal: new Uint8Array(n), gl: new Float32Array(n * 3) };
+  for (let i = 0; i < n; i++) {
+    st.pos[2 * i] = rand() * W; st.pos[2 * i + 1] = rand() * H;
+    st.phase[i] = rand() * 6.283; st.petal[i] = rand() < 0.35 ? 1 : 0;
+  }
+  return st;
+}
+function stepSnow(st, fit, t) {
+  const W = stage.width, H = stage.height, dt = frameDt;
+  const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.2;
+  const fall = H * 0.09, sway = W * 0.02, r = 2 * pixelRatio;
+  for (let i = 0; i < st.n; i++) {
+    const ix = 2 * i, iy = ix + 1;
+    let x = st.pos[ix], y = st.pos[iy], vx = st.vel[ix], vy = st.vel[iy];
+    const inside = gridHasBody ? bodyAt(x, y, fit) : 0;
+    if (st.rest[i] === 1) {                       // resting on the body
+      const m = gridHasBody ? motionAt(x, y + r * 2, fit, h) : null;
+      if (inside > 0.6) {                          // body rose into it: lift / throw
+        const mm = motionAt(x, y, fit, h);
+        if (mm && Math.hypot(mm.vx, mm.vy) > W * 0.35 * (1.5 - 0.5 * S.push)) { st.rest[i] = 0; vx = mm.vx * 1.1; vy = mm.vy * 1.1 - H * 0.1; }
+        else { for (let s = 0; s < 6 && bodyAt(x, y, fit) > 0.55; s++) y -= r; }
+      } else if (bodyAt(x, y + r * 2, fit) < 0.35) { st.rest[i] = 0; vx = m ? m.vx * 0.5 : 0; vy = 0; }
+      else if (m) { x += m.vx * dt * 0.8; }        // ride sideways with the body
+    } else if (st.rest[i] === 2) {               // resting on the floor, melting
+      st.melt[i] -= dt;
+      if (st.melt[i] <= 0) { st.rest[i] = 0; x = rand() * W; y = -10; vx = vy = 0; }
+    } else {                                     // falling
+      vx += (Math.sin(t * 0.8 + st.phase[i]) * sway - vx) * Math.min(1, dt * 1.5);
+      vy += (fall - vy) * Math.min(1, dt * 1.2);
+      x += vx * dt; y += vy * dt;
+      if (gridHasBody && inside < 0.6 && bodyAt(x, y + r, fit) > 0.5 && vy > -H * 0.05) { st.rest[i] = 1; vx = vy = 0; }
+      else if (inside > 0.6) {                     // the body moved into it: knocked away
+        const m = motionAt(x, y, fit, h);
+        if (m) { vx = m.vx; vy = m.vy - H * 0.05; } else { y -= r * 2; }
+      }
+      if (y > H - r) { st.rest[i] = 2; y = H - r; st.melt[i] = 3 + rand() * 4; }
+      if (x < -20) x += W + 40; if (x > W + 20) x -= W + 40;
+    }
+    st.pos[ix] = x; st.pos[iy] = y; st.vel[ix] = vx; st.vel[iy] = vy;
+    const a = st.rest[i] === 2 ? Math.min(1, st.melt[i] / 2) * 0.8 : 0.85;
+    const k = 3 * i; st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = a + (st.petal[i] ? 2 : 0);
+  }
+  drawPoints(null, st.gl, st.n, Math.max(2.5, 4.2 * pixelRatio * Math.sqrt(1 / Math.max(0.5, S.dots))), 2, 0);
+}
+
+// =============== Ripples (water surface) ===============
+function initRipples() {
+  const W = stage.width, H = stage.height, L = 170;
+  const rw = W >= H ? L : Math.round((L * W) / H), rh = W >= H ? Math.round((L * H) / W) : L;
+  const n = rw * rh;
+  return { rw, rh, cur: new Float32Array(n), old: new Float32Array(n), bodyPrev: new Float32Array(n), bytes: new Uint8Array(n), tex: makeTex(rw, rh, gl.LUMINANCE) };
+}
+function stepRipples(st, fit) {
+  const W = stage.width, H = stage.height, { rw, rh } = st;
+  const k = 0.9 * S.push;
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const i = y * rw + x;
+    const b = gridHasBody ? bodyAt(((x + 0.5) / rw) * W, ((y + 0.5) / rh) * H, fit) : 0;
+    st.cur[i] += (b - st.bodyPrev[i]) * k; st.bodyPrev[i] = b;
+  }
+  const damp = 0.975 + 0.02 * Math.min(1, S.springBack * 0.5);
+  for (let it = 0; it < 2; it++) {
+    const c = st.cur, o = st.old;
+    for (let y = 1; y < rh - 1; y++) for (let x = 1; x < rw - 1; x++) {
+      const i = y * rw + x;
+      o[i] = ((c[i - 1] + c[i + 1] + c[i - rw] + c[i + rw]) * 0.5 - o[i]) * damp;
+    }
+    st.cur = o; st.old = c;
+  }
+  for (let i = 0; i < st.cur.length; i++) { const v = 128 + st.cur[i] * 110; st.bytes[i] = v < 0 ? 0 : v > 255 ? 255 : v; }
+  gl.bindTexture(gl.TEXTURE_2D, st.tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, rw, rh, gl.LUMINANCE, gl.UNSIGNED_BYTE, st.bytes);
+}
+
+// =============== Wind (streaks flowing around the body) ===============
+function initWind() {
+  const W = stage.width, H = stage.height, n = Math.round(2200 * S.dots);
+  const st = { n, pos: new Float32Array(n * 2), vel: new Float32Array(n * 2), gl: new Float32Array(n * 3) };
+  for (let i = 0; i < n; i++) { st.pos[2 * i] = rand() * W; st.pos[2 * i + 1] = rand() * H; st.vel[2 * i] = W * 0.12; }
+  return st;
+}
+function stepWind(st, fit, t) {
+  const W = stage.width, H = stage.height, dt = frameDt;
+  const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.5;
+  const U = W * 0.13, relax = Math.min(1, dt * 1.6), norm = 1 / (U * 2.5);
+  for (let i = 0; i < st.n; i++) {
+    const ix = 2 * i, iy = ix + 1;
+    let x = st.pos[ix], y = st.pos[iy], vx = st.vel[ix], vy = st.vel[iy];
+    // gently wandering current
+    const th = 0.45 * Math.sin(x * 0.004 / pixelRatio + t * 0.35) * Math.cos(y * 0.005 / pixelRatio - t * 0.25) + 0.2 * Math.sin(t * 0.13);
+    vx += (U * Math.cos(th) - vx) * relax; vy += (U * Math.sin(th) - vy) * relax;
+    if (gridHasBody) {
+      const b = bodyAt(x, y, fit);
+      if (b > 0.02) {
+        // flow around the body: remove the part of the velocity heading into it, push out
+        let gx = (bodyAt(x + h, y, fit) - bodyAt(x - h, y, fit)) * 0.5, gy = (bodyAt(x, y + h, fit) - bodyAt(x, y - h, fit)) * 0.5;
+        const gl2 = Math.hypot(gx, gy);
+        if (gl2 > 1e-4) {
+          gx /= gl2; gy /= gl2;
+          const into = vx * gx + vy * gy;
+          if (into > 0) { vx -= into * gx * 1.6; vy -= into * gy * 1.6; }
+          vx -= gx * U * 2 * b * dt * 10; vy -= gy * U * 2 * b * dt * 10;
+        }
+        const m = motionAt(x, y, fit, h);   // gusts from fast movement
+        if (m) { vx += m.vx * 0.6 * S.push; vy += m.vy * 0.6 * S.push; }
+      }
+    }
+    x += vx * dt; y += vy * dt;
+    if (x > W + 5 || x < -5 || y < -5 || y > H + 5) { if (x > W + 5 || rand() < 0.5) { x = -2; y = rand() * H; } else { x = rand() * W; y = y < 0 ? H : 0; } vx = U; vy = 0; }
+    st.pos[ix] = x; st.pos[iy] = y; st.vel[ix] = vx; st.vel[iy] = vy;
+    const k = 3 * i; st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = Math.min(1, Math.hypot(vx, vy) * norm);
+  }
+  fadeTrail(0.9);
+  drawPoints(fbB, st.gl, st.n, Math.max(1.5, 2 * pixelRatio), 3, 0);
+  swapTrail();
+}
+
+// =============== Strings (plucked by the body) ===============
+function initStrings() {
+  const H = stage.height, ns = Math.max(3, Math.round(9 * S.dots)), np = 90;
+  const st = { ns, np, y0: new Float32Array(ns), d: new Float32Array(ns * np), v: new Float32Array(ns * np), gl: new Float32Array(ns * (np - 1) * 6 * 3) };
+  for (let s = 0; s < ns; s++) st.y0[s] = H * (0.1 + (0.8 * (s + 0.5)) / ns);
+  return st;
+}
+function stepStrings(st, fit) {
+  const W = stage.width, H = stage.height, { ns, np } = st;
+  const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.2, dx = W / (np - 1);
+  const push = H * 0.0035 * S.push, maxD = H * 0.18;
+  const damp = 0.992 + 0.006 * Math.min(1, S.springBack * 0.5);
+  for (let sub = 0; sub < 4; sub++) {
+    for (let s = 0; s < ns; s++) {
+      const base = s * np;
+      for (let i = 1; i < np - 1; i++) {
+        const j = base + i;
+        let a = (st.d[j - 1] + st.d[j + 1] - 2 * st.d[j]) * 0.35 - st.d[j] * 0.006;
+        if (gridHasBody && sub === 0) {
+          const x = i * dx, y = st.y0[s] + st.d[j], b = bodyAt(x, y, fit);
+          if (b > 0.45) {
+            let gy = bodyAt(x, y + h, fit) - bodyAt(x, y - h, fit);
+            if (Math.abs(gy) < 0.02) gy = y < frameToScreen(gridCx, gridCy, fit)[1] ? 1 : -1;
+            a -= Math.sign(gy) * push * b * 4;
+          }
+        }
+        st.v[j] = (st.v[j] + a) * damp;
+      }
+      for (let i = 1; i < np - 1; i++) { const j = base + i; st.d[j] = Math.max(-maxD, Math.min(maxD, st.d[j] + st.v[j])); }
+    }
+  }
+  let k = 0;
+  for (let s = 0; s < ns; s++) {
+    const base = s * np;
+    for (let i = 0; i < np - 1; i++) {
+      const j = base + i, glow = 0.35 + Math.min(1.1, (Math.abs(st.v[j]) + Math.abs(st.v[j + 1])) / (H * 0.004));
+      for (let q = 0; q < 6; q++) {
+        const tt = q / 6, x = (i + tt) * dx, y = st.y0[s] + st.d[j] * (1 - tt) + st.d[j + 1] * tt;
+        st.gl[3 * k] = cx(x); st.gl[3 * k + 1] = cy(y); st.gl[3 * k + 2] = glow; k++;
+      }
+    }
+  }
+  drawPoints(null, st.gl, k, Math.max(2, 2.4 * pixelRatio), 4, 0.4);
+}
+
+// =============== Ink (a slow liquid stirred by movement) ===============
+function initInk() {
+  const W = stage.width, H = stage.height, L = 112;
+  const w = W >= H ? L : Math.round((L * W) / H), h = W >= H ? Math.round((L * H) / W) : L, n = w * h;
+  const f = () => new Float32Array(n);
+  return { w, h, u: f(), v: f(), u0: f(), v0: f(), p: f(), div: f(), r: f(), g: f(), b: f(), r0: f(), g0: f(), b0: f(), bc: f(), bp: f(), bytes: new Uint8Array(n * 4), tex: makeTex(w, h) };
+}
+function sampleBilinear(a, w, h, x, y) {
+  x = Math.max(0.5, Math.min(w - 1.5, x)); y = Math.max(0.5, Math.min(h - 1.5, y));
+  const x0 = x | 0, y0 = y | 0, tx = x - x0, ty = y - y0, i = y0 * w + x0;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + w] * (1 - tx) + a[i + w + 1] * tx) * ty;
+}
+function stepInk(st, fit, t) {
+  const W = stage.width, H = stage.height, { w, h } = st, dt = frameDt;
+  // body in ink-grid cells, and its motion (cells/s)
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    st.bp[i] = st.bc[i];
+    st.bc[i] = gridHasBody ? bodyAt(((x + 0.5) / w) * W, ((y + 0.5) / h) * H, fit) : 0;
+  }
+  const col = hueRGB(t * 0.03).map((c) => Math.max(0, (c - 0.15) * 1.15));  // saturated
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x, db = st.bc[i] - st.bp[i];
+    if (Math.abs(db) < 0.03) continue;
+    const gx = (st.bc[i + 1] - st.bc[i - 1] + st.bp[i + 1] - st.bp[i - 1]) / 4, gy = (st.bc[i + w] - st.bc[i - w] + st.bp[i + w] - st.bp[i - w]) / 4;
+    const g2 = gx * gx + gy * gy; if (g2 < 1e-5) continue;
+    let mx = (-db * gx) / g2, my = (-db * gy) / g2;
+    const m = Math.hypot(mx, my); if (m < 0.3) continue;   // ignore edge jitter, react to real movement
+    if (m > 3) { mx *= 3 / m; my *= 3 / m; }
+    const k = Math.min(1, Math.abs(db) * 3) * 0.7 * S.push;
+    st.u[i] += (mx / dt - st.u[i]) * k; st.v[i] += (my / dt - st.v[i]) * k;
+    const ink = Math.min(1, Math.abs(db) * 2.5) * 0.22;
+    st.r[i] = Math.min(1, st.r[i] + col[0] * ink); st.g[i] = Math.min(1, st.g[i] + col[1] * ink); st.b[i] = Math.min(1, st.b[i] + col[2] * ink);
+  }
+  // advect velocity
+  st.u0.set(st.u); st.v0.set(st.v);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x, px = x - dt * st.u0[i], py = y - dt * st.v0[i];
+    st.u[i] = sampleBilinear(st.u0, w, h, px, py) * 0.995; st.v[i] = sampleBilinear(st.v0, w, h, px, py) * 0.995;
+  }
+  // keep it swirling, not spreading: remove divergence
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x; st.div[i] = -0.5 * (st.u[i + 1] - st.u[i - 1] + st.v[i + w] - st.v[i - w]); st.p[i] = 0;
+  }
+  for (let it = 0; it < 16; it++) for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x; st.p[i] = (st.div[i] + st.p[i - 1] + st.p[i + 1] + st.p[i - w] + st.p[i + w]) * 0.25;
+  }
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x; st.u[i] -= 0.5 * (st.p[i + 1] - st.p[i - 1]); st.v[i] -= 0.5 * (st.p[i + w] - st.p[i - w]);
+  }
+  // advect and slowly fade the ink
+  st.r0.set(st.r); st.g0.set(st.g); st.b0.set(st.b);
+  const fade = Math.exp(-dt * (0.08 + 0.35 * (1 - Math.min(1, S.springBack / 2))));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x, px = x - dt * st.u[i], py = y - dt * st.v[i];
+    st.r[i] = sampleBilinear(st.r0, w, h, px, py) * fade; st.g[i] = sampleBilinear(st.g0, w, h, px, py) * fade; st.b[i] = sampleBilinear(st.b0, w, h, px, py) * fade;
+    const o = 4 * i;
+    st.bytes[o] = Math.min(255, st.r[i] * 210); st.bytes[o + 1] = Math.min(255, st.g[i] * 210); st.bytes[o + 2] = Math.min(255, st.b[i] * 210); st.bytes[o + 3] = 255;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, st.tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, st.bytes);
+}
+
+// ---- trail buffer helpers (sparks, wind) ----
+function fadeTrail(decay) { run("fade", fbB, (a) => { a.tex("u_prev", fbA.tex); a.f("u_decay", decay); }); }
+function swapTrail() { [fbA, fbB] = [fbB, fbA]; }
+
+const WORLD_INIT = { dots: initDots, web: initWeb, sparks: initSparks, snow: initSnow, ripples: initRipples, wind: initWind, strings: initStrings, ink: initInk };
+function freeWorld() { if (W_ && W_.tex) gl.deleteTexture(W_.tex); W_ = null; }
+
+function renderField(now, fit, common, t) {
+  frameDt = Math.min(0.15, Math.max(0.02, (now - (lastFrameT || now - 50)) / 1000)); lastFrameT = now;
+  const name = WORLD_LIST.includes(S.world) ? S.world : "dots";
+  const key = `${name}:${stage.width}x${stage.height}:${S.dots}`;
+  if (key !== worldKey) { freeWorld(); W_ = WORLD_INIT[name](); worldKey = key; if (name === "sparks" || name === "wind") clearFeedback(); }
+  const compose = (tex, mode, flip, texel) => run("compose", null, (a) => {
+    common(a); a.tex("u_bg", tex); a.f("u_bgMode", mode); a.f("u_flipY", flip); a.f("u_texel", ...(texel || [0, 0]));
+  });
+  switch (name) {
+    case "dots": run("shadow", null, common); stepDots(W_, fit); break;
+    case "web": run("shadow", null, common); stepWeb(W_, fit); break;
+    case "snow": run("shadow", null, common); stepSnow(W_, fit, t); break;
+    case "strings": run("shadow", null, common); stepStrings(W_, fit); break;
+    case "sparks": stepSparks(W_, fit); compose(fbA.tex, 0, 0); break;
+    case "wind": stepWind(W_, fit, t); compose(fbA.tex, 0, 0); break;
+    case "ripples": stepRipples(W_, fit); compose(W_.tex, 1, 1, [1 / W_.rw, 1 / W_.rh]); break;
+    case "ink": stepInk(W_, fit, t); compose(W_.tex, 0, 1); break;
+  }
 }
 
 let startTime = performance.now();
@@ -874,9 +1338,7 @@ function render(now) {
   if (S.mode === "shadow") {
     run("shadow", null, common);
   } else if (S.mode === "field") {
-    run("shadow", null, common);
-    stepDots(now, fit);
-    drawDots();
+    renderField(now, fit, common, t);
   } else if (S.mode === "trails" || S.mode === "paint") {
     const trails = S.mode === "trails";
     // decay per frame: trails fade within ~0.2–4 s; paint lingers or stays forever
@@ -1125,6 +1587,10 @@ function syncUI() {
   document.querySelectorAll("#looks button").forEach((b) => b.classList.toggle("on", b.dataset.look === S.look));
   $("lookNote").textContent = S.look === "custom" ? "· custom (fine-tuned)" : "";
   document.querySelectorAll("[data-field]").forEach((b) => b.classList.toggle("on", b.dataset.field === S.fieldMode));
+  document.querySelectorAll("[data-world]").forEach((b) => b.classList.toggle("on", b.dataset.world === S.world));
+  $("scatterRow").style.display = S.world === "dots" ? "" : "none";
+  $("returnRow").style.display = ["dots", "ripples", "strings", "ink"].includes(S.world) ? "" : "none";
+  $("returnLabel").textContent = { dots: "Return", ripples: "Linger", strings: "Ring", ink: "Linger" }[S.world] || "Return";
   $("limbsRow").style.display = S.model === "body" ? "" : "none";
   document.querySelectorAll("#styles button[data-style]").forEach((b) => b.classList.toggle("on", b.dataset.style === S.style));
   $("invertBtn").classList.toggle("on", S.invert);
@@ -1146,6 +1612,8 @@ document.querySelectorAll("#looks button").forEach((b) => b.addEventListener("cl
   Object.assign(S, LOOKS[b.dataset.look]); S.look = b.dataset.look; save(); syncUI();
 }));
 document.querySelectorAll("[data-field]").forEach((b) => b.addEventListener("click", () => { S.fieldMode = b.dataset.field; save(); syncUI(); }));
+document.querySelectorAll("[data-world]").forEach((b) => b.addEventListener("click", () => { S.world = b.dataset.world; worldKey = ""; save(); syncUI(); }));
+$("clearWorldBtn").addEventListener("click", () => { worldKey = ""; clearFeedback(); });
 document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListener("input", () => {
   S[inp.dataset.key] = parseFloat(inp.value);
   if (LOOK_KEYS.includes(inp.dataset.key) && S.look !== "custom") { S.look = "custom"; syncUI(); }
