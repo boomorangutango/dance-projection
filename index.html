@@ -143,7 +143,7 @@
   <div class="section">
     <div class="row">
       <button id="autoBtn">Auto: off</button>
-      <button id="autoByBtn">With the music</button>
+      <button id="autoByBtn">When the song changes</button>
     </div>
     <label class="slider" id="autoSecsRow">Switch every <input data-key="autoSecs" type="range" min="10" max="120" step="5"><span></span></label>
   </div>
@@ -252,7 +252,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v13";
+const APP_VERSION = "v14";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -283,7 +283,7 @@ const DEFAULTS = {
   sticky: 0.3, cleanup: 0.15, limbs: 1, follow: true,
   look: "smooth",
   musicAmt: 1, beatSens: 1.25, partnerBeats: 0,
-  auto: "off", autoBy: "music", autoSecs: 30, scheme: "natural",
+  auto: "off", autoBy: "changes", autoSecs: 30, scheme: "natural",
   tapBpm: 100, ribbonBottom: false, metro: false, metroClick: false, tapEcho: true, tapRibbon: true, tapFigure: true, heelToe: false, tapSens: 1,
   world: "dots", fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
@@ -885,6 +885,9 @@ class Listen extends AudioWorkletProcessor {
     this.TL = new Float32Array(750); this.TLi = 0; this.TLn = 0; this.tfloor = 0;
     this.pk = [0, 0];
     this.sendAcc = [0, 0, 0]; this.sendN = 0; this.sens = 1.25; this.tsens = 1;
+    // band-pass centred on the kick drum (~65 Hz), so steady low notes above it leak in far less
+    const w0 = 2 * Math.PI * 65 / sampleRate, al = Math.sin(w0) / (2 * 0.9), a0 = 1 + al;
+    this.bq = { b0: al / a0, b2: -al / a0, a1: -2 * Math.cos(w0) / a0, a2: (1 - al) / a0, x1: 0, x2: 0, y1: 0, y2: 0 };
     this.port.onmessage = (m) => { if (m.data) { if (m.data.sens) this.sens = m.data.sens; if (m.data.tsens) this.tsens = m.data.tsens; } };
   }
   process(inputs) {
@@ -895,7 +898,9 @@ class Listen extends AudioWorkletProcessor {
     for (let i = 0; i < ch.length; i++) {
       const x = ch[i];
       for (let k = 0; k < 5; k++) f[k] += a[k] * (x - f[k]);
-      const kick = f[1] - f[0], bass = f[2] - f[1], mid = f[3] - f[2], high = x - f[3], vh = x - f[4];
+      const q = this.bq, kick = q.b0 * x + q.b2 * q.x2 - q.a1 * q.y1 - q.a2 * q.y2;
+      q.x2 = q.x1; q.x1 = x; q.y2 = q.y1; q.y1 = kick;
+      const bass = f[2] - f[1], mid = f[3] - f[2], high = x - f[3], vh = x - f[4];
       acc[0] += kick * kick; acc[1] += bass * bass; acc[2] += mid * mid; acc[3] += high * high; acc[4] += vh * vh;
       if (++this.n >= this.hop) this.frame();
     }
@@ -908,12 +913,13 @@ class Listen extends AudioWorkletProcessor {
     const t = currentTime;
     this.sinceFloor++;
     // ---- beats ----
-    for (let k = 0; k < 4; k++) this.es[k] += (e[k] - this.es[k]) * 0.33;
+    // kick band averaged over ~30 ms (a kick lasts ~100 ms; shorter windows just flicker), others ~12 ms
+    for (let k = 0; k < 4; k++) this.es[k] += (e[k] - this.es[k]) * (k === 0 ? 0.13 : 0.33);
     const w = [3.0, 1.2, 0.8, 0.3];
-    let on = 0;
+    let on = 0, onK = 0;
     for (let k = 0; k < 4; k++) {
-      const lg = Math.log10(this.es[k] + 1e-11);
-      on += Math.max(0, lg - this.ref[k]) * w[k];
+      const lg = Math.log10(this.es[k] + 1e-11), r = Math.max(0, lg - this.ref[k]);
+      on += r * w[k]; if (k === 0) onK = r;
       this.ref[k] += (lg - this.ref[k]) * 0.085;
     }
     const H = this.hist; H.push(on); if (H.length > 250) H.shift();
@@ -934,7 +940,8 @@ class Listen extends AudioWorkletProcessor {
     this.TL[this.TLi] = this.tes; this.TLi = (this.TLi + 1) % this.TL.length; this.TLn = Math.min(this.TLn + 1, this.TL.length);
     if (this.sinceFloor >= 60) { this.sinceFloor = 0; this.floor = this.pct10(this.L, this.Ln); this.tfloor = this.pct10(this.TL, this.TLn); }
 
-    if (H.length > 90 && this.prev > this.prevThr && on < this.prev && t - this.lastBeat > 0.28 && loud > this.floor * 1.6 && loud > 1e-8) {
+    // a beat needs a real rise in the kick-drum band (about 2 dB or more), not just hiss or hats
+    if (H.length > 90 && this.prev > this.prevThr && on < this.prev && t - this.lastBeat > 0.28 && this.prevK > 0.2 / this.sens && loud > this.floor * 1.6 && loud > 1e-8) {
       this.lastBeat = t;
       this.port.postMessage({ beat: Math.min(1, 0.45 + 0.5 * (this.prev - this.prevThr) / (this.prevThr + 1e-6)), t: t - 0.004 });
     }
@@ -946,17 +953,77 @@ class Listen extends AudioWorkletProcessor {
         t: t - 0.004
       });
     }
+    this.prevK = Math.max(onK, (this.prevK || 0) * 0.5);
     this.prev = on; this.prevThr = thr; this.tprev = ton; this.tprevThr = tthr; this.pk = [this.tes, e[4]];
-    this.sendAcc[0] += e[0] + e[1]; this.sendAcc[1] += e[2]; this.sendAcc[2] += e[3];
-    if (++this.sendN >= 6) { this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)), t }); this.sendAcc = [0, 0, 0]; this.sendN = 0; }
+    this.sendAcc[0] += e[0] + e[1]; this.sendAcc[1] += e[2]; this.sendAcc[2] += e[3]; this.sendK = (this.sendK || 0) + e[0];
+    if (++this.sendN >= 6) {
+      this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)), k: Math.sqrt(this.sendK / this.sendN), t });
+      this.sendAcc = [0, 0, 0]; this.sendK = 0; this.sendN = 0;
+    }
   }
 }
 registerProcessor("listen", Listen);`;
+
+// ---------------- Song changes ----------------
+// Watches for the moments a song shifts: the beat dropping out (lull), the beat
+// coming back, a clear build or drop in real loudness, a tempo change, or the
+// rhythm getting busier or sparser. Each one becomes an event for Auto.
+const SD = { dbS: -60, dbL: -60, kS: -80, kL: -80, inLull: false, bpmL: 0, bpmOffSince: 0, pending: null, label: "", labelAt: 0, lastEvent: 0 };
+function songEvent(kind, lively, now) {
+  if (now - SD.lastEvent < 3) return;          // one change at a time
+  SD.lastEvent = now; SD.pending = { kind, lively, at: now };
+  (SD.log = SD.log || []).push(`${kind}@${now.toFixed(1)}`);
+  SD.label = kind; SD.labelAt = now;
+}
+function watchSong(raw, kick, dt, now) {
+  const db = 20 * Math.log10(raw[0] + raw[1] + raw[2] + 1e-6);
+  if (SD.dbS < -59) { SD.dbS = SD.dbL = db; }
+  SD.dbS += (db - SD.dbS) * Math.min(1, dt / 1.2);
+  SD.dbL += (db - SD.dbL) * Math.min(1, dt / 8);
+  const musicPlaying = db > -62;
+  // the kick drum's own loudness: 1.5 s now versus the 6 s before
+  const kdb = 20 * Math.log10(kick + 1e-7);
+  if (SD.kS < -79) { SD.kS = SD.kL = kdb; }
+  SD.kS += (kdb - SD.kS) * Math.min(1, dt / 0.8);
+  SD.kL += (kdb - SD.kL) * Math.min(1, dt / 6);
+  // compare with the loudest / quietest moments of the last 6 s (sampled 4 times a second)
+  if (now - (SD.histAt || 0) > 0.25) {
+    SD.histAt = now;
+    (SD.kH = SD.kH || []).push(SD.kS); (SD.dH = SD.dH || []).push(SD.dbS);
+    if (SD.kH.length > 24) { SD.kH.shift(); SD.dH.shift(); }
+  }
+  if (SD.kH && SD.kH.length >= 8) {
+    const kMax = Math.max(...SD.kH), kMin = Math.min(...SD.kH), dMax = Math.max(...SD.dH), dMin = Math.min(...SD.dH);
+    const reset = () => { SD.kH = [SD.kS]; SD.dH = [SD.dbS]; };
+    if (!SD.inLull && SD.kS < kMax - 5 && musicPlaying) { SD.inLull = true; songEvent("lull", false, now); reset(); }
+    else if (SD.kS > kMin + 5) { songEvent(SD.inLull ? "beat back" : "beat in", true, now); SD.inLull = false; reset(); }
+    else if (SD.dbS > dMin + 6) { songEvent("build", true, now); reset(); }
+    else if (SD.dbS < dMax - 6 && musicPlaying) { songEvent("drop", false, now); reset(); }
+  }
+  const beatNow = !SD.inLull && now - (M.lastBeatWall || 0) < 3;
+  // tempo change that holds for 2 s
+  if (M.bpm) {
+    if (!SD.bpmL) SD.bpmL = M.bpm;
+    const r = M.bpm / SD.bpmL;
+    if (r > 1.1 || r < 0.9) {
+      if (!SD.bpmOffSince) SD.bpmOffSince = now;
+      if (now - SD.bpmOffSince > 2) { songEvent(r > 1 ? "faster" : "slower", r > 1, now); SD.bpmL = M.bpm; SD.bpmOffSince = 0; }
+    } else { SD.bpmOffSince = 0; SD.bpmL += (M.bpm - SD.bpmL) * Math.min(1, dt / 10); }
+  }
+  // busier or sparser rhythm: hits per second now (3 s) versus before (the 6 s before that)
+  const B = M.beats, tNow = B.length ? Math.max(B[B.length - 1], 0) : 0;
+  if (B.length > 8 && beatNow && B[B.length - 1] - B[0] > 9) {
+    const recent = B.filter((b) => tNow - b < 3).length / 3, before = B.filter((b) => tNow - b >= 3 && tNow - b < 9).length / 6;
+    if (before > 0.4 && recent >= 2 && recent / before > 1.85) songEvent("busier", true, now);
+    else if (before > 0.8 && recent / before < 0.45) songEvent("sparser", false, now);
+  }
+}
 
 function onWorklet(msg) {
   const d = msg.data, now = performance.now(), dt = Math.min(0.1, Math.max(0.005, (now - (M.lastT || now - 24)) / 1000));
   if (d.lv) {
     M.lastT = now;
+    watchSong(d.lv, d.k || 0, dt, now / 1000);
     const lv = d.lv.map((v, k) => { M.peaks[k] = Math.max(M.peaks[k] * Math.exp(-dt * 0.25), v, 4e-3); return Math.min(1, v / M.peaks[k]); });
     const ease = (x, v) => x + (v - x) * (v > x ? 0.6 : Math.min(1, dt * 6));
     M.bass = ease(M.bass, lv[0]); M.mid = ease(M.mid, lv[1]); M.high = ease(M.high, lv[2]);
@@ -1081,7 +1148,7 @@ function analyzeMusic(now) {
 }
 
 function estimateTempo() {
-  const B = M.beats; if (B.length < 6) return;
+  const last = M.beats[M.beats.length - 1], B = M.beats.filter((b) => last - b < 8); if (B.length < 6) return;
   // intervals between beats 1 and 2 apart, folded into 80–180 BPM
   const iv = [];
   for (let i = 1; i < B.length; i++) for (let k = 1; k <= 2 && i - k >= 0; k++) {
@@ -1127,7 +1194,8 @@ function updateMeter() {
   el.querySelector('[data-bar="m"]').style.height = `${Math.round(M.mid * 100)}%`;
   el.querySelector('[data-bar="h"]').style.height = `${Math.round(M.high * 100)}%`;
   el.querySelector(".dot").style.opacity = (0.15 + 0.85 * Math.max(M.beat, M.pulse * 0.5)).toFixed(2);
-  el.querySelector(".bpm").textContent = M.bpm ? `${M.bpm} bpm` : "listening";
+  const heard = SD.label && performance.now() / 1000 - SD.labelAt < 2.5 ? ` · ${SD.label}` : "";
+  el.querySelector(".bpm").textContent = (M.bpm ? `${M.bpm} bpm` : "listening") + heard;
 }
 
 // ---------------- Field: interactive worlds ----------------
@@ -2063,7 +2131,18 @@ function autoTick(now) {
   const secs = (now - A.last) / 1000;
   if (!A.last) { A.last = now; A.beatAt = M.beatCount; return; }
   const key = S.auto === "field" ? "field" : "all";
-  const useMusic = S.autoBy === "music" && M.on;
+  const useMusic = S.autoBy !== "timer" && M.on;
+  if (useMusic && S.autoBy === "changes") {
+    // only when the song changes; switch on the next beat if there is one
+    const ev = SD.pending;
+    if (!ev || secs < 6) { if (ev && secs < 6) SD.pending = null; return; }
+    if (!A.waitFrom) { A.waitFrom = now; A.waitBeat = M.beatCount; }
+    const onBeat = M.beatCount !== A.waitBeat, waited = now - A.waitFrom > 700;
+    if (!onBeat && !waited && ev.kind !== "lull") return;
+    SD.pending = null; A.waitFrom = 0; A.last = now;
+    switchTo((ev.lively ? LIVELY : CALM)[key]);
+    return;
+  }
   if (!useMusic) {
     if (secs >= S.autoSecs) { A.last = now; switchTo([...new Set([...CALM[key], ...LIVELY[key]])]); }
     return;
@@ -2073,9 +2152,8 @@ function autoTick(now) {
   const intensity = M.energy * 0.6 + M.pulse * 0.4;
   A.short += (intensity - A.short) * dt / 2; A.long += (intensity - A.long) * dt / 12;
   const phrase = M.period && M.beatCount - A.beatAt >= 32;          // about 8 bars
-  const shift = Math.abs(A.short - A.long) > 0.18 && secs > 8;      // the song builds or drops
-  const tooLong = secs > Math.max(45, S.autoSecs * 1.5);            // no clear beat: don't stay forever
-  if ((phrase && secs > 10) || shift || tooLong) {
+  const tooLong = !M.period && secs > Math.max(45, S.autoSecs * 1.5);   // no beat at all: don't stay forever
+  if ((phrase && secs > 10) || tooLong) {
     A.last = now; A.beatAt = M.beatCount; A.long = A.short;
     const lively = A.short > 0.55 || (M.bpm > 118 && A.short > 0.4);
     switchTo((lively ? LIVELY : CALM)[key]);
@@ -2383,7 +2461,7 @@ function syncUI() {
   document.querySelectorAll("[data-scheme]").forEach((b) => b.classList.toggle("on", b.dataset.scheme === S.scheme));
   $("autoBtn").textContent = { off: "Auto: off", field: "Auto: Field worlds", all: "Auto: everything" }[S.auto];
   $("autoBtn").classList.toggle("on", S.auto !== "off");
-  $("autoByBtn").textContent = S.autoBy === "music" ? "With the music" : "On a timer";
+  $("autoByBtn").textContent = { changes: "When the song changes", music: "Every 8 bars", timer: "On a timer" }[S.autoBy] || "When the song changes";
   $("autoByBtn").style.display = S.auto === "off" ? "none" : "";
   $("autoSecsRow").style.display = S.auto !== "off" && (S.autoBy === "timer" || !M.on) ? "" : "none";
   $("metroBtn").textContent = S.metro ? "Metronome: on" : "Metronome: off"; $("metroBtn").classList.toggle("on", S.metro);
@@ -2451,7 +2529,10 @@ $("autoBtn").addEventListener("click", () => {
   const order = ["off", "field", "all"]; S.auto = order[(order.indexOf(S.auto) + 1) % order.length];
   A.last = 0; save(); syncUI();
 });
-$("autoByBtn").addEventListener("click", () => { S.autoBy = S.autoBy === "music" ? "timer" : "music"; A.last = 0; save(); syncUI(); });
+$("autoByBtn").addEventListener("click", () => {
+  const order = ["changes", "music", "timer"]; S.autoBy = order[(order.indexOf(S.autoBy) + 1) % order.length];
+  A.last = 0; SD.pending = null; save(); syncUI();
+});
 $("musicBtn").addEventListener("click", async () => {
   const note = $("musicNote");
   if (M.on) { stopMusic(); note.textContent = ""; syncUI(); return; }
@@ -2538,7 +2619,7 @@ else {
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, beats: () => M.beats.map((x) => +x.toFixed(3)), pick: () => currentPick(), tap: () => ({ n: T.log.length, graded: T.log.filter((x) => x.on !== null && x.on !== undefined).length, on: T.log.filter((x) => x.on).length, feet: T.feet.map((f) => f && f.map(Math.round)), streak: T.streak, times: T.log.map((x) => +x.t.toFixed(3)) }), startMetro: () => startMetro(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, beats: () => M.beats.map((x) => +x.toFixed(3)), pick: () => currentPick(), events: () => SD.log || [], tap: () => ({ n: T.log.length, graded: T.log.filter((x) => x.on !== null && x.on !== undefined).length, on: T.log.filter((x) => x.on).length, feet: T.feet.map((f) => f && f.map(Math.round)), streak: T.streak, times: T.log.map((x) => +x.t.toFixed(3)) }), startMetro: () => startMetro(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
