@@ -139,7 +139,7 @@
         <button id="fillBtn">Fill screen</button>
       </div>
       <div class="row">
-        <button id="modelBtn">Model: Body</button>
+        <button id="modelBtn">Model: Selfie</button>
         <button id="engineBtn">Engine: GPU</button>
         <button id="fullBtn">Fullscreen</button>
         <button id="resetBtn">Reset settings</button>
@@ -163,7 +163,7 @@ const MODELS = {
   // Full-body pose model: a body mask plus joint positions. Trained on whole bodies
   // at a distance, so it suits dancing better than the selfie models.
   body: {
-    label: "Body", kind: "pose",
+    label: "Pose (test)", kind: "pose",
     url: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
   },
   // Selfie models: made for video calls (one person close to the camera).
@@ -176,7 +176,7 @@ const MODELS = {
     url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
   }
 };
-const MODEL_ORDER = ["body", "fast", "quality"];
+const MODEL_ORDER = ["fast", "quality", "body"];
 const DEMO = new URLSearchParams(location.search).has("demo");
 
 // ---------------- Settings (remembered on this device) ----------------
@@ -184,16 +184,16 @@ const DEFAULTS = {
   mode: "shadow",
   smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
   sticky: 0.3, cleanup: 0.15, limbs: 1,
-  style: "neon", line: 3, invert: false, fill: false,
+  style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
   paintFade: 0.15, hueSpeed: 0.35,
   delay: 1.0, shift: 0, facing: true,
-  mirror: true, facingMode: "user", model: "body", engine: "gpu"
+  mirror: true, facingMode: "user", model: "fast", engine: "gpu"
 };
-const STORE_KEY = "shadow-partner-settings-v3";
+const STORE_KEY = "shadow-partner-settings-v4";
 let S = { ...DEFAULTS };
 try { Object.assign(S, JSON.parse(localStorage.getItem(STORE_KEY) || "{}")); } catch (e) {}
-if (!MODELS[S.model]) S.model = "body";
+if (!MODELS[S.model]) S.model = "fast";
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch (e) {} }
 
 // ---------------- DOM ----------------
@@ -486,33 +486,47 @@ function drawSkeleton(poses, w, h) {
   }
 }
 
-// Remove specks: keep pieces that touch a tracked person, or that are at least
-// a fraction of the size of the biggest piece.
-const compArea = [], compKeep = [];
+// Remove specks: keep big pieces, pieces touching a tracked person, and small
+// pieces sitting right next to a big piece (a hand split from its arm). Small
+// pieces out on their own in the background are dropped.
+const comp = { area: [], touch: [], x0: [], x1: [], y0: [], y1: [], keep: [] };
 function removeSpecks(w, h, havePose) {
   const n = w * h;
   labels.fill(0);
-  compArea.length = 1; let biggest = 0, label = 0;
-  const touch = [false];
+  let biggest = 0, label = 0;
   for (let i = 0; i < n; i++) {
     if (!state[i] || labels[i]) continue;
     label++; let area = 0, touches = false, sp = 0;
+    let x0 = w, x1 = 0, y0 = h, y1 = 0;
     stack[sp++] = i; labels[i] = label;
     while (sp) {
       const k = stack[--sp]; area++; if (mark[k]) touches = true;
-      const x = k % w;
+      const x = k % w, y = (k - x) / w;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
       if (x > 0 && state[k - 1] && !labels[k - 1]) { labels[k - 1] = label; stack[sp++] = k - 1; }
       if (x < w - 1 && state[k + 1] && !labels[k + 1]) { labels[k + 1] = label; stack[sp++] = k + 1; }
       if (k >= w && state[k - w] && !labels[k - w]) { labels[k - w] = label; stack[sp++] = k - w; }
       if (k < n - w && state[k + w] && !labels[k + w]) { labels[k + w] = label; stack[sp++] = k + w; }
     }
-    compArea[label] = area; touch[label] = touches;
+    comp.area[label] = area; comp.touch[label] = touches;
+    comp.x0[label] = x0; comp.x1[label] = x1; comp.y0[label] = y0; comp.y1[label] = y1;
     if (area > biggest) biggest = area;
   }
   const minArea = Math.max(n * 0.0015, biggest * S.cleanup);
-  compKeep.length = label + 1;
-  for (let c = 1; c <= label; c++) compKeep[c] = (havePose && touch[c]) || compArea[c] >= minArea;
-  for (let i = 0; i < n; i++) if (labels[i] && !compKeep[labels[i]]) state[i] = 0;
+  const big = [];
+  for (let c = 1; c <= label; c++) {
+    comp.keep[c] = comp.area[c] >= minArea || (havePose && comp.touch[c]);
+    if (comp.keep[c]) big.push(c);
+  }
+  for (let c = 1; c <= label; c++) {
+    if (comp.keep[c]) continue;
+    for (const b of big) {
+      const m = 0.12 * Math.max(comp.x1[b] - comp.x0[b], comp.y1[b] - comp.y0[b]) + 2;
+      if (comp.x1[c] >= comp.x0[b] - m && comp.x0[c] <= comp.x1[b] + m &&
+          comp.y1[c] >= comp.y0[b] - m && comp.y0[c] <= comp.y1[b] + m) { comp.keep[c] = true; break; }
+    }
+  }
+  for (let i = 0; i < n; i++) if (labels[i] && !comp.keep[labels[i]]) state[i] = 0;
 }
 
 function processMask(p, w, h, poses) {
