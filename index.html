@@ -138,6 +138,7 @@
         <button id="flipBtn">Switch camera</button>
         <button id="mirrorBtn">Mirror</button>
         <button id="fillBtn">Fill screen</button>
+        <button id="followBtn">Follow me</button>
       </div>
       <div class="row">
         <button id="modelBtn">Model: Selfie</button>
@@ -158,7 +159,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v6";
+const APP_VERSION = "v7";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -186,7 +187,7 @@ const DEMO = new URLSearchParams(location.search).has("demo");
 const DEFAULTS = {
   mode: "shadow",
   smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
-  sticky: 0.3, cleanup: 0.15, limbs: 1,
+  sticky: 0.3, cleanup: 0.15, limbs: 1, follow: true,
   style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
   paintFade: 0.15, hueSpeed: 0.35,
@@ -270,6 +271,20 @@ vec3 hue(float h) {
 }`;
 
 const SHADERS = {
+  // Put the model's mask (made from a zoomed-in crop) back where it belongs in the full frame.
+  place: `precision mediump float; varying vec2 v_uv;
+    uniform sampler2D u_crop; uniform vec4 u_rect;
+    void main() {
+      vec2 q = (v_uv - u_rect.xy) / u_rect.zw;
+      float inside = step(0.0, q.x) * step(q.x, 1.0) * step(0.0, q.y) * step(q.y, 1.0);
+      gl_FragColor = vec4(vec3(texture2D(u_crop, clamp(q, 0.0, 1.0)).r * inside), 1.0); }`,
+  // Sticky on/off: turns on above u_hi, only turns off below u_lo.
+  sticky: `precision mediump float; varying vec2 v_uv;
+    uniform sampler2D u_raw; uniform sampler2D u_prev; uniform float u_hi; uniform float u_lo;
+    void main() {
+      float p = texture2D(u_raw, v_uv).r; float was = texture2D(u_prev, v_uv).r;
+      float on = was > 0.5 ? step(u_lo, p) : step(u_hi, p);
+      gl_FragColor = vec4(vec3(on), 1.0); }`,
   // Steadiness: blend the new mask with the previous steadied one.
   steady: `precision mediump float; varying vec2 v_uv;
     uniform sampler2D u_new; uniform sampler2D u_prev; uniform float u_k;
@@ -399,25 +414,27 @@ function run(name, target, bind) {
 
 // ---------------- GPU state that depends on sizes ----------------
 let maskW = 0, maskH = 0;
-let maskTex = null;            // raw mask from the model
+let rawFull = null, stickyA = null, stickyB = null; // full-frame raw mask and sticky state
 let steadyA = null, steadyB = null, blurTmp = null, field = null;
 const HISTORY = 100;           // ~3.3 s at 30 fps, for the partner delay
 let history = [], historyTime = new Float64Array(HISTORY), historyHead = -1, historyCount = 0;
 let fbA = null, fbB = null;    // feedback buffers for trails / paint
-let maskBytes = null;
+// The model sees a crop that follows the dancer; this is that crop in the full frame (0..1).
+let roi = { x: 0, y: 0, w: 1, h: 1 }, roiLost = 0;
+let cropTex = null, cropW = 0, cropH = 0, cropBytes = null;
+let fullW = 480, fullH = 360;   // full-frame mask size (set from the camera's shape)
+const FULL_LONG = 640;
 
 function ensureMaskTargets(w, h) {
   if (w === maskW && h === maskH) return;
   maskW = w; maskH = h;
-  if (maskTex) gl.deleteTexture(maskTex);
-  [steadyA, steadyB, blurTmp, field].forEach(freeTarget);
+  [rawFull, stickyA, stickyB, steadyA, steadyB, blurTmp, field].forEach(freeTarget);
   history.forEach((t) => gl.deleteTexture(t));
-  maskTex = makeTex(w, h, gl.LUMINANCE);
+  rawFull = makeTarget(w, h); stickyA = makeTarget(w, h); stickyB = makeTarget(w, h);
   steadyA = makeTarget(w, h); steadyB = makeTarget(w, h);
   blurTmp = makeTarget(w, h); field = makeTarget(w, h);
   history = []; for (let i = 0; i < HISTORY; i++) history.push(makeTex(w, h, gl.LUMINANCE));
   historyHead = -1; historyCount = 0;
-  maskBytes = new Uint8Array(w * h);
 }
 
 let pixelRatio = 1;
@@ -532,23 +549,59 @@ function removeSpecks(w, h, havePose) {
   for (let i = 0; i < n; i++) if (labels[i] && !comp.keep[labels[i]]) state[i] = 0;
 }
 
-function processMask(p, w, h, poses) {
-  ensureMaskTargets(w, h);
+function processMask(p, w, h, poses, rect) {
+  ensureMaskTargets(fullW, fullH);
+  if (w !== cropW || h !== cropH) {
+    if (cropTex) gl.deleteTexture(cropTex);
+    cropTex = makeTex(w, h, gl.LUMINANCE); cropW = w; cropH = h; cropBytes = new Uint8Array(w * h);
+  }
   const n = w * h;
   if (!state || state.length !== n) {
     state = new Uint8Array(n); mark = new Uint8Array(n);
     labels = new Int32Array(n); stack = new Int32Array(n);
   }
-  // Sticky on/off: a pixel turns on above 0.5 but only turns off below 0.5 - stickiness.
-  const hi = 0.5, lo = Math.max(0.02, 0.5 - S.sticky);
-  for (let i = 0; i < n; i++) state[i] = state[i] ? (p[i] > lo ? 1 : 0) : (p[i] > hi ? 1 : 0);
+  for (let i = 0; i < n; i++) state[i] = p[i] > 0.5 ? 1 : 0;
   mark.fill(0);
   const havePose = poses && poses.length > 0 && S.limbs > 0;
   if (havePose) drawSkeleton(poses, w, h);
   if (S.cleanup > 0) removeSpecks(w, h, havePose);
-  for (let i = 0; i < n; i++) maskBytes[i] = state[i] * 255;
-  gl.bindTexture(gl.TEXTURE_2D, maskTex);
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
+  // Box around what's left, for following the dancer
+  let bx0 = w, bx1 = -1, by0 = h, by1 = -1;
+  for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+    if (state[i]) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y; }
+    cropBytes[i] = mark[i] ? 255 : (p[i] > 0.5 && !state[i]) ? 0 : p[i] * 255;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, cropTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, cropBytes);
+  run("place", rawFull, (a) => { a.tex("u_crop", cropTex); a.f("u_rect", rect.x, rect.y, rect.w, rect.h); });
+  updateRoi(bx1 >= 0 ? { x0: bx0, x1: bx1, y0: by0, y1: by1 } : null, w, h, rect);
+}
+
+// Follow the dancer: aim the crop at the body with a margin, zoom out fast when a
+// limb reaches the crop's edge, zoom in slowly, and go back to the full view if
+// nobody is found for a moment.
+const MIN_ZOOM_BOX = 0.4; // at most 2.5x
+function updateRoi(b, w, h, r) {
+  if (!S.follow) { roi = { x: 0, y: 0, w: 1, h: 1 }; return; }
+  let tz, tcx, tcy;
+  if (!b) {
+    if (++roiLost < 10) return;
+    tz = 1; tcx = 0.5; tcy = 0.5;
+  } else {
+    roiLost = 0;
+    const x0 = r.x + (b.x0 / w) * r.w, x1 = r.x + ((b.x1 + 1) / w) * r.w;
+    const y0 = r.y + (b.y0 / h) * r.h, y1 = r.y + ((b.y1 + 1) / h) * r.h;
+    tcx = (x0 + x1) / 2; tcy = (y0 + y1) / 2;
+    tz = Math.max(x1 - x0, y1 - y0) * 1.45;
+    const atEdge = r.w < 0.999 && (b.x0 <= 1 || b.y0 <= 1 || b.x1 >= w - 2 || b.y1 >= h - 2);
+    if (atEdge) tz = Math.max(tz, r.w * 1.35);
+  }
+  tz = Math.min(1, Math.max(MIN_ZOOM_BOX, tz));
+  const z = roi.w + (tz - roi.w) * (tz > roi.w ? 0.6 : 0.08);
+  const cx = roi.x + roi.w / 2, cy = roi.y + roi.h / 2;
+  const ncx = cx + (tcx - cx) * 0.35, ncy = cy + (tcy - cy) * 0.35;
+  const clamp = (v) => Math.min(1 - z, Math.max(0, v));
+  roi = { x: clamp(ncx - z / 2), y: clamp(ncy - z / 2), w: z, h: z };
 }
 
 // Read a model mask into a person-probability buffer (union of all people).
@@ -566,13 +619,20 @@ function readMasks(masks, invert) {
 
 // ---------------- Per-frame GPU pipeline ----------------
 function buildField(now) {
-  // 1. Steadiness (temporal smoothing)
-  run("steady", steadyB, (a) => { a.tex("u_new", maskTex); a.tex("u_prev", steadyA.tex); a.f("u_k", S.steady); });
+  // 1. Sticky on/off, then steadiness (temporal smoothing)
+  run("sticky", stickyB, (a) => {
+    a.tex("u_raw", rawFull.tex); a.tex("u_prev", stickyA.tex);
+    a.f("u_hi", 0.5); a.f("u_lo", Math.max(0.02, 0.5 - S.sticky));
+  });
+  [stickyA, stickyB] = [stickyB, stickyA];
+  run("steady", steadyB, (a) => { a.tex("u_new", stickyA.tex); a.tex("u_prev", steadyA.tex); a.f("u_k", S.steady); });
   [steadyA, steadyB] = [steadyB, steadyA];
   // 2. Blur: rounds off the stair-steps and pinholes before the edge is cut
   let src = steadyA;
   const passes = S.smooth > 4 ? 2 : (S.smooth > 0 ? 1 : 0);
-  const r = passes === 2 ? S.smooth * 0.42 : S.smooth * 0.6;
+  // Smoothness is tuned for a 320-pixel mask; scale it so it looks the same at any size.
+  const scale = Math.max(maskW, maskH) / 320;
+  const r = (passes === 2 ? S.smooth * 0.42 : S.smooth * 0.6) * scale;
   for (let i = 0; i < passes; i++) {
     run("blur", blurTmp, (a) => { a.tex("u_src", src.tex); a.f("u_dir", r / maskW, 0); });
     run("blur", field, (a) => { a.tex("u_src", blurTmp.tex); a.f("u_dir", 0, r / maskH); });
@@ -729,7 +789,10 @@ function processFrame() {
   const k = PROC_LONG / Math.max(vw, vh);
   const pw = Math.round(vw * k), ph = Math.round(vh * k);
   if (proc.width !== pw || proc.height !== ph) { proc.width = pw; proc.height = ph; }
-  procCtx.drawImage(video, 0, 0, pw, ph);
+  const kf = FULL_LONG / Math.max(vw, vh);
+  fullW = Math.round(vw * kf); fullH = Math.round(vh * kf);
+  const r = { ...roi };
+  procCtx.drawImage(video, r.x * vw, r.y * vh, r.w * vw, r.h * vh, 0, 0, pw, ph);
 
   const ts = Math.max(now, lastTs + 1); lastTs = ts;
   const t0 = performance.now();
@@ -737,16 +800,16 @@ function processFrame() {
   if (segKind === "pose") {
     segmenter.detectForVideo(proc, ts, (result) => {
       const masks = result.segmentationMasks;
-      if (masks && masks.length) { const [p, w, h] = readMasks(masks, false); processMask(p, w, h, result.landmarks); got = true; }
+      if (masks && masks.length) { const [p, w, h] = readMasks(masks, false); processMask(p, w, h, result.landmarks, r); got = true; }
     });
   } else {
     segmenter.segmentForVideo(proc, ts, (result) => {
       const masks = result.confidenceMasks;
-      if (masks && masks.length) { const [p, w, h] = readMasks([masks[0]], MODELS[S.model].invert); processMask(p, w, h, null); got = true; }
+      if (masks && masks.length) { const [p, w, h] = readMasks([masks[0]], MODELS[S.model].invert); processMask(p, w, h, null, r); got = true; }
     });
   }
   // No person found: show an empty wall (fade out through steadiness).
-  if (!got && maskW) { if (!prob || prob.length !== maskW * maskH) prob = new Float32Array(maskW * maskH); prob.fill(0); processMask(prob, maskW, maskH, null); }
+  if (!got) { if (!prob || prob.length !== pw * ph) prob = new Float32Array(pw * ph); prob.fill(0); processMask(prob, pw, ph, null, r); }
   segTotal += performance.now() - t0;
   if (!maskW) return;
   buildField(now);
@@ -761,7 +824,8 @@ function countFrame(now) {
     const fps = Math.round(frames * 1000 / (now - fpsStart));
     const secs = (now - fpsStart) / 1000;
     const cam = camDelivered ? ` · camera sending ${Math.round(camDelivered / secs)}` : (camFps ? ` · camera set to ${camFps}` : "");
-    fpsEl.textContent = `${APP_VERSION} · ${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}`;
+    const zoom = S.follow ? ` · zoom ${(1 / roi.w).toFixed(1)}x` : "";
+    fpsEl.textContent = `${APP_VERSION} · ${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}${zoom}`;
     frames = 0; segTotal = 0; workTotal = 0; camDelivered = 0; fpsStart = now;
   }
 }
@@ -829,6 +893,7 @@ function demoMask(t, w, h) {
 function demoLoop() {
   const w = 320, h = 240;
   proc.width = w; proc.height = h;
+  S.follow = false;
   const tick = () => {
     if (!running) return;
     const now = performance.now();
@@ -838,7 +903,8 @@ function demoLoop() {
       const bx = (Math.random() * w) | 0, by = (Math.random() * h) | 0;
       for (let y = by; y < Math.min(h, by + 4); y++) for (let x = bx; x < Math.min(w, bx + 4); x++) dm[y * w + x] = 0.9;
     }
-    processMask(dm, w, h, null);
+    fullW = 480; fullH = 360;
+    processMask(dm, w, h, null, { x: 0, y: 0, w: 1, h: 1 });
     segTotal += performance.now() - t0;
     buildField(now); render(now); workTotal += performance.now() - now; countFrame(now);
     requestAnimationFrame(tick);
@@ -867,6 +933,8 @@ function syncUI() {
   document.querySelectorAll("#styles button[data-style]").forEach((b) => b.classList.toggle("on", b.dataset.style === S.style));
   $("invertBtn").classList.toggle("on", S.invert);
   $("fillBtn").classList.toggle("on", S.fill);
+  $("followBtn").classList.toggle("on", S.follow);
+  $("followBtn").textContent = S.follow ? "Follow me: on" : "Follow me: off";
   $("fillBtn").textContent = S.fill ? "Fill screen" : "Whole frame";
   $("facingBtn").classList.toggle("on", S.facing);
   $("facingBtn").textContent = S.facing ? "Facing me" : "Same direction";
@@ -886,6 +954,7 @@ document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListen
 $("clearBtn").addEventListener("click", clearFeedback);
 document.querySelectorAll("#styles button[data-style]").forEach((b) => b.addEventListener("click", () => { S.style = b.dataset.style; save(); syncUI(); }));
 $("invertBtn").addEventListener("click", () => { S.invert = !S.invert; save(); syncUI(); });
+$("followBtn").addEventListener("click", () => { S.follow = !S.follow; save(); syncUI(); });
 $("fillBtn").addEventListener("click", () => { S.fill = !S.fill; save(); syncUI(); });
 $("facingBtn").addEventListener("click", () => { S.facing = !S.facing; save(); syncUI(); });
 $("mirrorBtn").addEventListener("click", () => { S.mirror = !S.mirror; save(); syncUI(); });
@@ -958,7 +1027,7 @@ else {
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, draw: (t) => { buildField(t); render(t); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
