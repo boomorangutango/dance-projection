@@ -85,6 +85,7 @@
   <p>Set the phone where it can see your whole body, then tap start and allow the camera.</p>
   <button id="startBtn" disabled>Start</button>
   <div id="status">Loading…</div>
+  <div id="version" style="color: var(--muted); font-size: 12px;"></div>
 </div>
 
 <div id="fps"></div>
@@ -156,6 +157,8 @@
 // -> WebGL: steadiness blend, blur, crisp edge, effects -> screen
 // ======================================================================
 
+// Bump with every change so the phone shows which version it loaded.
+const APP_VERSION = "v6";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -758,7 +761,7 @@ function countFrame(now) {
     const fps = Math.round(frames * 1000 / (now - fpsStart));
     const secs = (now - fpsStart) / 1000;
     const cam = camDelivered ? ` · camera sending ${Math.round(camDelivered / secs)}` : (camFps ? ` · camera set to ${camFps}` : "");
-    fpsEl.textContent = `${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}`;
+    fpsEl.textContent = `${APP_VERSION} · ${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}`;
     frames = 0; segTotal = 0; workTotal = 0; camDelivered = 0; fpsStart = now;
   }
 }
@@ -923,6 +926,8 @@ stage.addEventListener("click", () => {
   controls.classList.toggle("show"); fpsEl.classList.toggle("show");
 });
 syncUI();
+$("version").textContent = APP_VERSION;
+fpsEl.textContent = APP_VERSION;
 
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
