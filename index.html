@@ -123,6 +123,7 @@
   <div class="section">
     <div class="row"><button id="musicBtn">Music: off</button></div>
     <label class="slider" id="musicAmtRow">Music strength <input data-key="musicAmt" type="range" min="0" max="2" step="0.1"><span></span></label>
+    <label class="slider" id="beatSensRow">Beat sensitivity <input data-key="beatSens" type="range" min="0.6" max="2" step="0.05"><span></span></label>
     <div class="hint" id="musicNote" style="text-align:left"></div>
   </div>
 
@@ -207,7 +208,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v10";
+const APP_VERSION = "v11";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -237,7 +238,7 @@ const DEFAULTS = {
   smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
   sticky: 0.3, cleanup: 0.15, limbs: 1, follow: true,
   look: "smooth",
-  musicAmt: 1, partnerBeats: 0,
+  musicAmt: 1, beatSens: 1.25, partnerBeats: 0,
   world: "dots", fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
@@ -802,7 +803,7 @@ function fitRect() {
 // from the spacing between recent beats.
 const M = {
   on: false, ctx: null, an: null, stream: null, freq: null, prevMag: null,
-  bass: 0, mid: 0, high: 0, energy: 0, beat: 0, beatCount: 0, lastStrength: 0, lastBeat: 0,
+  bass: 0, mid: 0, high: 0, energy: 0, pulse: 0, bassAvg: 0, gridT: 0, beat: 0, beatCount: 0, lastStrength: 0, lastBeat: 0,
   beats: [], period: 0, bpm: 0, peaks: [1e-4, 1e-4, 1e-4], onsetHist: [], prevOnset: 0, lastT: 0
 };
 
@@ -813,56 +814,64 @@ const WORKLET_SRC = `
 class Listen extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.lpB = 0; this.lpM = 0; this.acc = [0, 0, 0]; this.n = 0;
+    this.f = [0, 0, 0, 0];               // one-pole low-passes at 40, 130, 300, 2000 Hz
+    this.acc = [0, 0, 0, 0]; this.n = 0;
     this.hop = Math.round(sampleRate * 0.006);
-    this.ref = [-6, -6, -6]; this.hist = []; this.t = 0; this.lastBeat = -1; this.prev = 0; this.prevThr = 0;
-    this.sendAcc = [0, 0, 0]; this.sendN = 0; this.es = [0, 0, 0];
+    this.es = [0, 0, 0, 0]; this.ref = [-9, -9, -9, -9];
+    this.hist = []; this.t = 0; this.lastBeat = -1; this.prev = 0; this.prevThr = 0;
     this.L = new Float32Array(500); this.Li = 0; this.Ln = 0; this.floor = 0; this.sinceFloor = 0;
+    this.sendAcc = [0, 0, 0]; this.sendN = 0; this.sens = 1.25;
+    this.port.onmessage = (m) => { if (m.data && m.data.sens) this.sens = m.data.sens; };
   }
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
     if (!ch) return true;
-    const aB = 1 - Math.exp(-2 * Math.PI * 150 / sampleRate), aM = 1 - Math.exp(-2 * Math.PI * 2000 / sampleRate);
+    const a = [40, 130, 300, 2000].map((hz) => 1 - Math.exp(-2 * Math.PI * hz / sampleRate));
+    const f = this.f;
     for (let i = 0; i < ch.length; i++) {
       const x = ch[i];
-      this.lpB += aB * (x - this.lpB); this.lpM += aM * (x - this.lpM);
-      const b = this.lpB, m = this.lpM - this.lpB, h = x - this.lpM;
-      this.acc[0] += b * b; this.acc[1] += m * m; this.acc[2] += h * h;
+      for (let k = 0; k < 4; k++) f[k] += a[k] * (x - f[k]);
+      const kick = f[1] - f[0];            // 40–130 Hz: kick drum
+      const bass = f[2] - f[1];            // 130–300 Hz
+      const mid = f[3] - f[2], high = x - f[3];
+      this.acc[0] += kick * kick; this.acc[1] += bass * bass; this.acc[2] += mid * mid; this.acc[3] += high * high;
       if (++this.n >= this.hop) this.frame();
     }
     return true;
   }
   frame() {
     const e = this.acc.map((v) => v / this.n);
-    this.acc = [0, 0, 0]; this.n = 0; this.t += this.hop / sampleRate;
-    // light smoothing (~15 ms) so plain noise doesn't flicker like a drum hit
-    for (let k = 0; k < 3; k++) this.es[k] += (e[k] - this.es[k]) * 0.4;
-    const lg = this.es.map((v) => Math.log10(v + 1e-10));
-    // onset: how far each band jumped above its recent level (bass counts most)
-    const w = [2.0, 1.0, 0.4];
+    this.acc = [0, 0, 0, 0]; this.n = 0; this.t += this.hop / sampleRate;
+    for (let k = 0; k < 4; k++) this.es[k] += (e[k] - this.es[k]) * 0.45;   // ~12 ms smoothing
+    // onset: rise of each band above its recent level (dB/10). Kick counts most.
+    const w = [3.0, 1.2, 0.8, 0.3];
     let on = 0;
-    for (let k = 0; k < 3; k++) { on += Math.max(0, lg[k] - this.ref[k]) * w[k]; this.ref[k] += (lg[k] - this.ref[k]) * 0.25; }
+    for (let k = 0; k < 4; k++) {
+      const lg = Math.log10(this.es[k] + 1e-11);
+      on += Math.max(0, lg - this.ref[k]) * w[k];
+      this.ref[k] += (lg - this.ref[k]) * 0.12;
+    }
     const H = this.hist; H.push(on); if (H.length > 170) H.shift();
     let mean = 0; for (const v of H) mean += v; mean /= H.length;
     let vr = 0; for (const v of H) vr += (v - mean) * (v - mean);
-    // never below a real jump (about 5 dB in the bass), however quiet the room
-    const thr = Math.max(1.0, mean + 1.6 * Math.sqrt(vr / H.length) + 0.15);
-    // the quiet level between hits: 10th percentile of the last 3 seconds
-    const loud = this.es[0] + this.es[1];
+    const sd = Math.sqrt(vr / H.length);
+    const thr = Math.max(0.3 / this.sens, mean + (1.8 / this.sens) * sd);
+    // quiet level between hits (10th percentile of the last 3 s), so hiss alone never counts
+    const loud = this.es[0] + this.es[1] + this.es[2];
     this.L[this.Li] = loud; this.Li = (this.Li + 1) % this.L.length; this.Ln = Math.min(this.Ln + 1, this.L.length);
     if (++this.sinceFloor >= 40) {
       this.sinceFloor = 0;
-      const a = Array.from(this.L.subarray(0, this.Ln)).sort((x, y) => x - y);
-      this.floor = a[Math.floor(a.length * 0.1)];
+      const s = Array.from(this.L.subarray(0, this.Ln)).sort((x, y) => x - y);
+      this.floor = s[Math.floor(s.length * 0.1)];
     }
-    // a beat is the peak of a rise above the threshold, at least 0.28 s after the last
-    if (H.length > 60 && this.prev > this.prevThr && on < this.prev && this.t - this.lastBeat > 0.28 && loud > this.floor * 6 && loud > 1e-7) {
+    if (H.length > 60 && this.prev > this.prevThr && on < this.prev && this.t - this.lastBeat > 0.28 &&
+        loud > this.floor * 1.6 && loud > 1e-8) {
       this.lastBeat = this.t;
-      this.port.postMessage({ beat: Math.min(1, 0.45 + (this.prev - this.prevThr) / (this.prevThr + 1e-6)), t: this.t });
+      this.port.postMessage({ beat: Math.min(1, 0.45 + 0.5 * (this.prev - this.prevThr) / (this.prevThr + 1e-6)), t: this.t });
     }
     this.prev = on; this.prevThr = thr;
-    for (let k = 0; k < 3; k++) this.sendAcc[k] += e[k];
-    if (++this.sendN >= 4) { this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)) }); this.sendAcc = [0, 0, 0]; this.sendN = 0; }
+    this.sendAcc[0] += e[0] + e[1]; this.sendAcc[1] += e[2]; this.sendAcc[2] += e[3];
+    if (++this.sendN >= 4) { this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)), t: this.t }); this.sendAcc = [0, 0, 0]; this.sendN = 0; }
   }
 }
 registerProcessor("listen", Listen);`;
@@ -875,13 +884,26 @@ function onWorklet(msg) {
     const ease = (x, v) => x + (v - x) * (v > x ? 0.6 : Math.min(1, dt * 6));
     M.bass = ease(M.bass, lv[0]); M.mid = ease(M.mid, lv[1]); M.high = ease(M.high, lv[2]);
     M.energy += ((lv[0] * 0.45 + lv[1] * 0.4 + lv[2] * 0.15) - M.energy) * Math.min(1, dt * 3);
+    // pulse: the bass compared with its own recent average, so it throbs even in loud, even music
+    const rb = d.lv[0];
+    M.bassAvg = M.bassAvg ? M.bassAvg + (rb - M.bassAvg) * Math.min(1, dt * 0.8) : rb;
+    const gate = Math.max(0, Math.min(1, (M.energy - 0.12) / 0.15));   // only when there's real music
+    const pu = Math.max(0, Math.min(1, (rb / (M.bassAvg + 1e-9) - 0.85) * 2.2)) * gate;
+    M.pulse += (pu - M.pulse) * (pu > M.pulse ? 0.7 : Math.min(1, dt * 8));
     M.beat *= Math.exp(-dt * 7);
-    if (now / 1000 - M.lastBeatWall > 4) { M.period = 0; M.bpm = 0; }
+    // flywheel: once the tempo is known, keep the beat going through the hits it misses
+    if (M.period && M.gridT && d.t - M.gridT > M.period * 1.02 && d.t - M.beats[M.beats.length - 1] < 4) {
+      M.gridT += M.period;
+      if (d.t - M.gridT < 0.1) { M.lastStrength = 0.6; M.beat = Math.max(M.beat, 0.6); M.beatCount++; }
+      else M.gridT = d.t;
+    }
+    if (now / 1000 - M.lastBeatWall > 4) { M.period = 0; M.bpm = 0; M.gridT = 0; }
   }
   if (d.beat) {
     M.lastStrength = d.beat; M.beat = d.beat; M.beatCount++; M.lastBeatWall = now / 1000;
     M.beats.push(d.t); while (M.beats.length && d.t - M.beats[0] > 12) M.beats.shift();
     estimateTempo();
+    M.gridT = d.t;   // realign the flywheel to the real hit
   }
 }
 
@@ -907,6 +929,7 @@ async function startMusic() {
     src.connect(node); node.connect(mute); mute.connect(M.ctx.destination);
     node.port.onmessage = onWorklet;
     M.node = node; M.src = src; M.worklet = true;
+    node.port.postMessage({ sens: S.beatSens });
   } catch (e) {
     console.warn("AudioWorklet unavailable, using the analyser fallback", e);
     M.an = M.ctx.createAnalyser(); M.an.fftSize = 2048; M.an.smoothingTimeConstant = 0;
@@ -927,7 +950,7 @@ function stopMusic() {
   try { if (M.node) { M.node.port.onmessage = null; M.node.disconnect(); } if (M.src) M.src.disconnect(); } catch (e) {}
   M.node = null; M.src = null;
   if (M.stream) M.stream.getTracks().forEach((t) => t.stop());
-  M.stream = null; M.beat = 0; M.energy = 0; M.bass = M.mid = M.high = 0;
+  M.stream = null; M.beat = 0; M.energy = 0; M.pulse = 0; M.bass = M.mid = M.high = 0;
 }
 
 function musicLoop(now) {
@@ -1012,7 +1035,8 @@ function beatEvent(st) {
   return 0;
 }
 const musicEnergy = () => (M.on ? M.energy * S.musicAmt : 0);
-const musicGlow = () => (M.on ? S.musicAmt * (0.6 * M.beat + 0.3 * M.energy) : 0);
+const musicPulse = () => (M.on ? M.pulse * S.musicAmt : 0);
+const musicGlow = () => (M.on ? S.musicAmt * (0.55 * M.beat + 0.2 * M.energy + 0.35 * M.pulse) : 0);
 function partnerDelay() {
   return M.on && S.partnerBeats && M.period ? Math.min(3.2, S.partnerBeats * M.period) : S.delay;
 }
@@ -1024,7 +1048,7 @@ function updateMeter() {
   el.querySelector('[data-bar="b"]').style.height = `${Math.round(M.bass * 100)}%`;
   el.querySelector('[data-bar="m"]').style.height = `${Math.round(M.mid * 100)}%`;
   el.querySelector('[data-bar="h"]').style.height = `${Math.round(M.high * 100)}%`;
-  el.querySelector(".dot").style.opacity = (0.15 + 0.85 * M.beat).toFixed(2);
+  el.querySelector(".dot").style.opacity = (0.15 + 0.85 * Math.max(M.beat, M.pulse * 0.5)).toFixed(2);
   el.querySelector(".bpm").textContent = M.bpm ? `${M.bpm} bpm` : "listening";
 }
 
@@ -1167,6 +1191,7 @@ function stepDots(st, fit) {
   const damp = Math.exp(-(gather ? 3.2 : 2.4) * dt);
   const [bcx, bcy] = frameToScreen(gridCx, gridCy, fit);
   const norm = 1 / (W * 0.6);
+  const shimmer = musicPulse() * 0.45 + musicEnergy() * 0.1;
   const kick = beatEvent(st);
   if (kick) {   // beat: a ripple of motion outward from the body (or the centre of the wall)
     const ox = gridHasBody ? bcx : W / 2, oy = gridHasBody ? bcy : stage.height / 2;
@@ -1197,7 +1222,7 @@ function stepDots(st, fit) {
     x += vx * dt; y += vy * dt;
     st.pos[ix] = x; st.pos[iy] = y; st.vel[ix] = vx; st.vel[iy] = vy;
     const k = 3 * i;
-    st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = Math.min(1.5, Math.hypot(vx, vy) * norm);
+    st.gl[k] = cx(x); st.gl[k + 1] = cy(y); st.gl[k + 2] = Math.min(1.5, Math.hypot(vx, vy) * norm + shimmer * (0.5 + 0.5 * Math.sin(i * 12.9898)));
   }
   drawPoints(null, st.gl, st.n, Math.max(2, 2.6 * pixelRatio * Math.sqrt(1 / S.dots)), 0, 1.6);
 }
@@ -1304,6 +1329,18 @@ function stepSparks(st, fit) {
     }
   }
   const kick = beatEvent(st);
+  if (M.on && gridHasBody) {   // smoulder: embers drift up off the outline with the music
+    let want = (musicEnergy() * 6 + musicPulse() * 10) * S.dots * (frameDt / 0.05);
+    want = Math.floor(want) + (rand() < want % 1 ? 1 : 0);
+    for (let tries = 0, made = 0; tries < want * 25 && made < want && st.n < st.max; tries++) {
+      const gx = 1 + ((rand() * (gridW - 2)) | 0), gy = 1 + ((rand() * (gridH - 2)) | 0), v = gridSoft[gy * gridW + gx];
+      if (v < 0.3 || v > 0.65) continue;
+      const [px, py] = frameToScreen((gx + 0.5) / gridW, (gy + 0.5) / gridH, fit), k = st.n++; made++;
+      st.pos[2 * k] = px; st.pos[2 * k + 1] = py;
+      st.vel[2 * k] = (rand() - 0.5) * W * 0.08; st.vel[2 * k + 1] = -H * (0.15 + rand() * 0.3);
+      st.span[k] = st.life[k] = 0.5 + rand() * 0.7;
+    }
+  }
   if (kick && gridHasBody) {
     const want = Math.round(70 * kick * S.dots);
     for (let tries = 0, made = 0; tries < want * 20 && made < want && st.n < st.max; tries++) {
@@ -1349,7 +1386,7 @@ function initSnow() {
 function stepSnow(st, fit, t) {
   const W = stage.width, H = stage.height, dt = frameDt;
   const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.2;
-  const fall = H * 0.09, sway = W * (0.02 + 0.03 * musicEnergy()), r = 2 * pixelRatio;
+  const fall = H * 0.09 * (1 + musicEnergy() * 0.6), sway = W * (0.02 + 0.03 * musicEnergy()), r = 2 * pixelRatio;
   const kick = beatEvent(st);
   for (let i = 0; i < st.n; i++) {
     const ix = 2 * i, iy = ix + 1;
@@ -1404,11 +1441,19 @@ function stepRipples(st, fit) {
     st.cur[i] += (b - st.bodyPrev[i]) * k; st.bodyPrev[i] = b;
     if (kick && b > 0.15 && b < 0.85) st.cur[i] += (1 - Math.abs(b - 0.5) * 2) * kick * 0.3;
   }
+  if (M.on) {   // rain on the water, heavier when the music is louder
+    let drops = (musicEnergy() * 0.5 + musicPulse() * 0.4) * (frameDt / 0.05);
+    drops = Math.floor(drops) + (rand() < drops % 1 ? 1 : 0);
+    for (let d = 0; d < drops; d++) {
+      const x0 = 3 + ((rand() * (rw - 6)) | 0), y0 = 3 + ((rand() * (rh - 6)) | 0), amp = 0.25 + rand() * 0.2;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) st.cur[(y0 + dy) * rw + x0 + dx] += amp * Math.exp(-(dx * dx + dy * dy) / 1.5);
+    }
+  }
   if (kick && !gridHasBody) {   // no one there: drop a ring somewhere
     const x0 = 3 + ((rand() * (rw - 6)) | 0), y0 = 3 + ((rand() * (rh - 6)) | 0);
-    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) st.cur[(y0 + dy) * rw + x0 + dx] += kick * 0.4;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) st.cur[(y0 + dy) * rw + x0 + dx] += kick * 0.4 * Math.exp(-(dx * dx + dy * dy) / 1.5);
   }
-  const damp = 0.975 + 0.02 * Math.min(1, S.springBack * 0.5);
+  const damp = 0.965 + 0.03 * Math.min(1, S.springBack * 0.5);
   for (let it = 0; it < 2; it++) {
     const c = st.cur, o = st.old;
     for (let y = 1; y < rh - 1; y++) for (let x = 1; x < rw - 1; x++) {
@@ -1478,7 +1523,12 @@ function stepStrings(st, fit) {
   const W = stage.width, H = stage.height, { ns, np } = st;
   const h = ((fit[2] * W) / Math.max(1, gridW)) * 1.2, dx = W / (np - 1);
   const push = H * 0.0035 * S.push, maxD = H * 0.18;
-  const damp = 0.992 + 0.006 * Math.min(1, S.springBack * 0.5);
+  const damp = 0.988 + 0.008 * Math.min(1, S.springBack * 0.5);
+  const hum = H * 0.00025 * (musicPulse() * 1.5 + musicEnergy() * 0.4) * (frameDt / 0.05);
+  if (hum > 0) for (let s = 0; s < ns; s++) {
+    const at = 6 + rand() * (np - 12), sgn = rand() < 0.5 ? -1 : 1;
+    for (let i = 1; i < np - 1; i++) st.v[s * np + i] += sgn * hum * Math.exp(-(((i - at) / 10) ** 2));
+  }
   const kick = beatEvent(st);
   if (kick) {
     for (let s = 0; s < ns; s++) {
@@ -1552,6 +1602,13 @@ function stepInk(st, fit, t) {
     st.u[i] += (mx / dt - st.u[i]) * k; st.v[i] += (my / dt - st.v[i]) * k;
     const ink = Math.min(1, Math.abs(db) * 2.5) * 0.22;
     st.r[i] = Math.min(1, st.r[i] + col[0] * ink); st.g[i] = Math.min(1, st.g[i] + col[1] * ink); st.b[i] = Math.min(1, st.b[i] + col[2] * ink);
+  }
+  const seep = M.on ? (musicEnergy() * 0.025 + musicPulse() * 0.05) * (frameDt / 0.05) : 0;
+  if (seep > 0) for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x, v = st.bc[i];
+    if (v < 0.3 || v > 0.65) continue;
+    st.r[i] = Math.min(1, st.r[i] + col[0] * seep); st.g[i] = Math.min(1, st.g[i] + col[1] * seep); st.b[i] = Math.min(1, st.b[i] + col[2] * seep);
+    st.v[i] -= 3 * seep * 20; st.u[i] += (rand() - 0.5) * 6 * seep * 20;
   }
   const kick = beatEvent(st);
   if (kick) {
@@ -1886,6 +1943,8 @@ function syncUI() {
   $("musicBtn").classList.toggle("on", M.on);
   $("musicBtn").textContent = M.on ? "Music: listening" : "Music: off";
   $("musicAmtRow").style.display = M.on ? "" : "none";
+  $("beatSensRow").style.display = M.on ? "" : "none";
+  if (M.node) M.node.port.postMessage({ sens: S.beatSens });
   $("beatDelayBtn").textContent = S.partnerBeats ? `Delay: ${S.partnerBeats} beat${S.partnerBeats > 1 ? "s" : ""}` : "Delay: seconds";
   $("beatDelayBtn").classList.toggle("on", !!S.partnerBeats);
   document.querySelectorAll("#looks button").forEach((b) => b.classList.toggle("on", b.dataset.look === S.look));
@@ -1920,6 +1979,7 @@ document.querySelectorAll("[data-world]").forEach((b) => b.addEventListener("cli
 $("clearWorldBtn").addEventListener("click", () => { worldKey = ""; clearFeedback(); });
 document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListener("input", () => {
   S[inp.dataset.key] = parseFloat(inp.value);
+  if (inp.dataset.key === "beatSens" && M.node) M.node.port.postMessage({ sens: S.beatSens });
   if (LOOK_KEYS.includes(inp.dataset.key) && S.look !== "custom") { S.look = "custom"; syncUI(); }
   inp.nextElementSibling.textContent = fmt(inp.dataset.key, S[inp.dataset.key]);
   save();
@@ -2011,7 +2071,7 @@ else {
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, music: () => ({ on: M.on, worklet: M.worklet, bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
