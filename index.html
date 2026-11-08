@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Shadow Partner</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --panel: rgba(18, 18, 18, 0.9);
+    --line: #3a3a3a;
+    --muted: #9a9a9a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden; touch-action: manipulation; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; background: var(--bg); }
+  video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  #intro {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 24px; text-align: center; background: var(--bg);
+  }
+  #intro h1 { margin: 0; font-weight: 300; letter-spacing: 0.3em; text-transform: uppercase; font-size: 22px; }
+  #intro p { margin: 0; color: var(--muted); max-width: 330px; line-height: 1.5; font-size: 15px; }
+  #startBtn {
+    margin-top: 8px; padding: 16px 44px; border-radius: 999px; border: 1px solid var(--fg);
+    background: transparent; color: var(--fg); font-size: 17px; letter-spacing: 0.15em; text-transform: uppercase;
+  }
+  #startBtn:disabled { opacity: 0.45; }
+  #status { color: var(--muted); font-size: 14px; min-height: 1.4em; max-width: 340px; line-height: 1.4; }
+
+  #controls {
+    position: fixed; left: 50%; bottom: max(14px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+    width: min(480px, calc(100vw - 32px)); max-height: 62vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    background: var(--panel); border-radius: 18px; padding: 14px 16px;
+    display: none; flex-direction: column; gap: 12px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+  #controls.show { display: flex; }
+  .modes, .styles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .styles button { font-size: 12px !important; padding: 8px 4px !important; }
+  .modes button, .styles button, .row button {
+    padding: 10px 8px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d0d; color: var(--fg);
+    font-size: 14px;
+  }
+  .modes button.on, .styles button.on, .row button.on { border-color: var(--fg); background: #222; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .row button { flex: 1 1 auto; font-size: 13px; }
+  .row button:disabled { opacity: 0.45; }
+  .section { display: flex; flex-direction: column; gap: 10px; }
+  .section[hidden] { display: none; }
+  .label { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+  label.slider { display: grid; grid-template-columns: 100px 1fr 40px; align-items: center; gap: 10px; font-size: 13px; color: #cfcfcf; }
+  label.slider input { width: 100%; accent-color: #fff; }
+  label.slider span { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  details summary { cursor: pointer; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary .label::after { content: " +"; }
+  details[open] summary .label::after { content: " −"; }
+  details .section { margin-top: 10px; }
+  .hint { font-size: 12px; color: var(--muted); text-align: center; }
+
+  #fps {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: 12px; font-size: 12px; color: var(--muted);
+    font-variant-numeric: tabular-nums; display: none; pointer-events: none;
+  }
+  #fps.show { display: block; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="stage"></canvas>
+
+<div id="intro">
+  <h1>Shadow Partner</h1>
+  <p>Set the phone where it can see your whole body, then tap start and allow the camera.</p>
+  <button id="startBtn" disabled>Start</button>
+  <div id="status">Loading…</div>
+</div>
+
+<div id="fps"></div>
+
+<div id="controls">
+  <div class="modes" id="modes">
+    <button data-mode="shadow">Shadow</button>
+    <button data-mode="trails">Trails</button>
+    <button data-mode="paint">Paint</button>
+    <button data-mode="partner">Partner</button>
+  </div>
+
+  <div class="section">
+    <div class="styles" id="styles">
+      <button data-style="solid">Solid</button>
+      <button data-style="outline">Outline</button>
+      <button data-style="neon">Neon edge</button>
+      <button id="invertBtn">Invert</button>
+    </div>
+    <label class="slider">Line width <input data-key="line" type="range" min="1" max="12" step="0.5"><span></span></label>
+  </div>
+
+  <div class="section" data-for="trails">
+    <label class="slider">Trail length <input data-key="trailLength" type="range" min="0" max="1" step="0.01"><span></span></label>
+  </div>
+  <div class="section" data-for="paint">
+    <label class="slider">Fade <input data-key="paintFade" type="range" min="0" max="1" step="0.01"><span></span></label>
+    <label class="slider">Color speed <input data-key="hueSpeed" type="range" min="0" max="1" step="0.01"><span></span></label>
+    <div class="row"><button id="clearBtn">Clear the wall</button></div>
+  </div>
+  <div class="section" data-for="partner">
+    <label class="slider">Delay (sec) <input data-key="delay" type="range" min="0.1" max="3" step="0.05"><span></span></label>
+    <label class="slider">Shift <input data-key="shift" type="range" min="-0.5" max="0.5" step="0.01"><span></span></label>
+    <div class="row"><button id="facingBtn">Facing me</button></div>
+  </div>
+
+  <details>
+    <summary><span class="label">Edges and setup</span></summary>
+    <div class="section">
+      <label class="slider">Smoothness <input data-key="smooth" type="range" min="0" max="8" step="0.5"><span></span></label>
+      <label class="slider">Steadiness <input data-key="steady" type="range" min="0" max="0.85" step="0.05"><span></span></label>
+      <label class="slider">Cutoff <input data-key="cutoff" type="range" min="0.25" max="0.75" step="0.01"><span></span></label>
+      <label class="slider">Softness <input data-key="soft" type="range" min="0" max="0.2" step="0.01"><span></span></label>
+      <label class="slider">Glow <input data-key="glow" type="range" min="0" max="1" step="0.05"><span></span></label>
+      <label class="slider">Size <input data-key="size" type="range" min="0.5" max="1.5" step="0.05"><span></span></label>
+      <div class="row">
+        <button id="flipBtn">Switch camera</button>
+        <button id="mirrorBtn">Mirror</button>
+        <button id="fillBtn">Fill screen</button>
+      </div>
+      <div class="row">
+        <button id="modelBtn">Model: Fast</button>
+        <button id="fullBtn">Fullscreen</button>
+        <button id="resetBtn">Reset settings</button>
+      </div>
+    </div>
+  </details>
+  <div class="hint">Tap the screen to hide or show these controls.</div>
+</div>
+
+<script type="module">
+// ======================================================================
+// Shadow Partner
+// Camera -> small frame -> MediaPipe body segmentation (GPU) -> small mask
+// -> WebGL: steadiness blend, blur, crisp edge, effects -> screen
+// ======================================================================
+
+const TASKS_VERSION = "0.10.14";
+const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
+const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
+const MODELS = {
+  fast: {
+    label: "Fast",
+    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+    invert: false   // channel 0 = person
+  },
+  quality: {
+    label: "Quality",
+    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+    invert: true    // channel 0 = background
+  }
+};
+const DEMO = new URLSearchParams(location.search).has("demo");
+
+// ---------------- Settings (remembered on this device) ----------------
+const DEFAULTS = {
+  mode: "shadow",
+  smooth: 3, steady: 0.3, cutoff: 0.45, soft: 0, glow: 0, size: 1,
+  style: "neon", line: 3, invert: false, fill: true,
+  trailLength: 0.6,
+  paintFade: 0.15, hueSpeed: 0.35,
+  delay: 1.0, shift: 0, facing: true,
+  mirror: true, facingMode: "user", model: "fast"
+};
+const STORE_KEY = "shadow-partner-settings-v2";
+let S = { ...DEFAULTS };
+try { Object.assign(S, JSON.parse(localStorage.getItem(STORE_KEY) || "{}")); } catch (e) {}
+function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch (e) {} }
+
+// ---------------- DOM ----------------
+const $ = (id) => document.getElementById(id);
+const video = $("video"), stage = $("stage"), intro = $("intro"), startBtn = $("startBtn");
+const statusEl = $("status"), controls = $("controls"), fpsEl = $("fps");
+
+// ---------------- WebGL setup ----------------
+const gl = stage.getContext("webgl", { antialias: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: "high-performance" });
+if (!gl) { statusEl.textContent = "This browser can't run the graphics this app needs (WebGL)."; throw new Error("no webgl"); }
+const derivExt = gl.getExtension("OES_standard_derivatives");
+
+const VERT = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() { v_uv = a_pos * 0.5 + 0.5; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+// Shared helpers for the display shaders. The field texture is the smoothed
+// "how much is this pixel a person" value, 0..1, stored top row first.
+const COMMON = `
+${derivExt ? "#extension GL_OES_standard_derivatives : enable" : ""}
+precision highp float;
+varying vec2 v_uv;
+uniform vec4 u_fit;      // image rect on screen: x0, y0, w, h (0..1)
+uniform float u_mirror;
+uniform float u_cut;
+uniform float u_soft;
+uniform float u_glow;
+uniform float u_style;   // 0 solid, 1 outline, 2 neon
+uniform float u_line;    // outline width in screen pixels
+uniform float u_invert;
+float fieldAt(sampler2D tex, vec2 uv) {
+  vec2 p = (uv - u_fit.xy) / u_fit.zw;
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 0.0;
+  if (u_mirror > 0.5) p.x = 1.0 - p.x;
+  p.y = 1.0 - p.y;
+  return texture2D(tex, p).r;
+}
+float aaWidth(float f) {
+  ${derivExt ? "return max(fwidth(f) * 0.9, 0.0015);" : "return 0.02;"}
+}
+// Crisp, anti-aliased body shape from the smooth field.
+float body(float f) {
+  float w = aaWidth(f) + u_soft;
+  return smoothstep(u_cut - w, u_cut + w, f);
+}
+// Soft halo just outside the body edge.
+float halo(float f) {
+  return u_glow * smoothstep(u_cut * 0.15, u_cut, f) * 0.55;
+}
+// Line along the body edge, u_line pixels wide.
+float outline(float f) {
+  ${derivExt ? "float d = abs(f - u_cut) / max(fwidth(f), 1e-4);" : "float d = abs(f - u_cut) / 0.01;"}
+  float h = u_line * 0.5;
+  return 1.0 - smoothstep(h - 0.5, h + 0.75 + u_soft * 40.0, d);
+}
+// The figure in the chosen style: 1 = full white.
+float figure(float f) {
+  float b = body(f);
+  if (u_style < 0.5) return b;
+  float l = outline(f);
+  if (u_style < 1.5) return l;
+  // Neon: dim fill that brightens toward the edge, with a crisp bright line.
+  float inner = b * (0.16 + 0.5 * (1.0 - smoothstep(u_cut, min(u_cut + 0.45, 0.99), f)));
+  return max(inner, l);
+}
+vec4 finish(vec3 c) { c = clamp(c, 0.0, 1.0); return vec4(mix(c, 1.0 - c, u_invert), 1.0); }
+vec3 hue(float h) {
+  vec3 k = clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+  return mix(vec3(1.0), k, 0.85);
+}`;
+
+const SHADERS = {
+  // Steadiness: blend the new mask with the previous steadied one.
+  steady: `precision mediump float; varying vec2 v_uv;
+    uniform sampler2D u_new; uniform sampler2D u_prev; uniform float u_k;
+    void main() { float n = texture2D(u_new, v_uv).r; float p = texture2D(u_prev, v_uv).r;
+      float k = n > p ? u_k * 0.25 : u_k;
+      gl_FragColor = vec4(vec3(mix(n, p, k)), 1.0); }`,
+  // Separable gaussian blur (9-tap equivalent using linear filtering).
+  blur: `precision mediump float; varying vec2 v_uv;
+    uniform sampler2D u_src; uniform vec2 u_dir;
+    void main() {
+      float s = texture2D(u_src, v_uv).r * 0.2270270270;
+      s += (texture2D(u_src, v_uv + u_dir * 1.3846153846).r + texture2D(u_src, v_uv - u_dir * 1.3846153846).r) * 0.3162162162;
+      s += (texture2D(u_src, v_uv + u_dir * 3.2307692308).r + texture2D(u_src, v_uv - u_dir * 3.2307692308).r) * 0.0702702703;
+      gl_FragColor = vec4(vec3(s), 1.0); }`,
+  shadow: COMMON + `
+    uniform sampler2D u_field;
+    void main() {
+      float f = fieldAt(u_field, v_uv);
+      float b = body(f);
+      vec3 c = vec3(figure(f)) + vec3(0.75, 0.85, 1.0) * halo(f) * (1.0 - b);
+      gl_FragColor = finish(c); }`,
+  // Feedback: fade what was there, then lay the current body on top.
+  feedback: COMMON + `
+    uniform sampler2D u_field; uniform sampler2D u_prev;
+    uniform float u_decay; uniform float u_sub; uniform float u_ink; uniform vec3 u_color;
+    void main() {
+      vec3 prev = texture2D(u_prev, v_uv).rgb;
+      prev = max(prev * u_decay - vec3(u_sub), 0.0);
+      float b = body(fieldAt(u_field, v_uv));
+      gl_FragColor = vec4(mix(prev, u_color, b * u_ink), 1.0); }`,
+  // Show the feedback buffer with the live body drawn over it.
+  trailsShow: COMMON + `
+    uniform sampler2D u_field; uniform sampler2D u_buf;
+    void main() {
+      float f = fieldAt(u_field, v_uv);
+      float b = body(f);
+      vec3 trail = texture2D(u_buf, v_uv).rgb * 0.55;
+      vec3 c = mix(trail * (1.0 - b), vec3(1.0), figure(f)) + vec3(0.75, 0.85, 1.0) * halo(f) * (1.0 - b);
+      gl_FragColor = finish(c); }`,
+  paintShow: COMMON + `
+    uniform sampler2D u_field; uniform sampler2D u_buf;
+    void main() {
+      float f = fieldAt(u_field, v_uv);
+      vec3 paint = texture2D(u_buf, v_uv).rgb;
+      float line = outline(f);
+      vec3 c = mix(paint, vec3(1.0), line * 0.95) + vec3(1.0) * halo(f) * 0.5;
+      gl_FragColor = finish(c); }`,
+  partner: COMMON + `
+    uniform sampler2D u_field; uniform sampler2D u_past;
+    uniform float u_facing; uniform float u_shift; uniform vec3 u_pcolor;
+    void main() {
+      float f = fieldAt(u_field, v_uv);
+      float me = body(f);
+      vec2 q = v_uv;
+      if (u_facing > 0.5) q.x = 1.0 - q.x;
+      q.x -= u_shift;
+      float pf = fieldAt(u_past, q);
+      float pa = body(pf);
+      vec3 c = u_pcolor * figure(pf) * 0.95;
+      c += u_pcolor * halo(pf) * (1.0 - pa) * 0.8;
+      c = mix(c * (1.0 - me), vec3(1.0), figure(f));
+      c += vec3(0.75, 0.85, 1.0) * halo(f) * (1.0 - me) * (1.0 - pa);
+      gl_FragColor = finish(c); }`
+};
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+const vs = compile(gl.VERTEX_SHADER, VERT);
+const programs = {};
+for (const [name, src] of Object.entries(SHADERS)) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, src));
+  gl.bindAttribLocation(p, 0, "a_pos");
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const uniforms = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const u = gl.getActiveUniform(p, i); uniforms[u.name] = gl.getUniformLocation(p, u.name); }
+  programs[name] = { p, u: uniforms };
+}
+
+const quad = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+function makeTex(w, h, format = gl.RGBA) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, format, w, h, 0, format, gl.UNSIGNED_BYTE, null);
+  return t;
+}
+function makeTarget(w, h) {
+  const tex = makeTex(w, h);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fb, w, h };
+}
+function freeTarget(t) { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } }
+
+function run(name, target, bind) {
+  const prog = programs[name];
+  gl.useProgram(prog.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fb : null);
+  gl.viewport(0, 0, target ? target.w : stage.width, target ? target.h : stage.height);
+  let unit = 0;
+  const api = {
+    tex(name, t) { if (prog.u[name] == null) return; gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(prog.u[name], unit); unit++; },
+    f(name, ...v) { const l = prog.u[name]; if (l == null) return; [gl.uniform1f, gl.uniform2f, gl.uniform3f, gl.uniform4f][v.length - 1].call(gl, l, ...v); }
+  };
+  bind(api);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ---------------- GPU state that depends on sizes ----------------
+let maskW = 0, maskH = 0;
+let maskTex = null;            // raw mask from the model
+let steadyA = null, steadyB = null, blurTmp = null, field = null;
+const HISTORY = 100;           // ~3.3 s at 30 fps, for the partner delay
+let history = [], historyTime = new Float64Array(HISTORY), historyHead = -1, historyCount = 0;
+let fbA = null, fbB = null;    // feedback buffers for trails / paint
+let maskBytes = null;
+
+function ensureMaskTargets(w, h) {
+  if (w === maskW && h === maskH) return;
+  maskW = w; maskH = h;
+  if (maskTex) gl.deleteTexture(maskTex);
+  [steadyA, steadyB, blurTmp, field].forEach(freeTarget);
+  history.forEach((t) => gl.deleteTexture(t));
+  maskTex = makeTex(w, h, gl.LUMINANCE);
+  steadyA = makeTarget(w, h); steadyB = makeTarget(w, h);
+  blurTmp = makeTarget(w, h); field = makeTarget(w, h);
+  history = []; for (let i = 0; i < HISTORY; i++) history.push(makeTex(w, h, gl.LUMINANCE));
+  historyHead = -1; historyCount = 0;
+  maskBytes = new Uint8Array(w * h);
+}
+
+let pixelRatio = 1;
+function resizeStage() {
+  // Keep the drawing buffer sharp but bounded so phones stay fast.
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let w = Math.round(window.innerWidth * dpr), h = Math.round(window.innerHeight * dpr);
+  const maxPixels = 2200000;
+  if (w * h > maxPixels) { const k = Math.sqrt(maxPixels / (w * h)); w = Math.round(w * k); h = Math.round(h * k); }
+  pixelRatio = w / Math.max(1, window.innerWidth);
+  if (w === stage.width && h === stage.height && fbA) return;
+  stage.width = w; stage.height = h;
+  freeTarget(fbA); freeTarget(fbB);
+  fbA = makeTarget(w, h); fbB = makeTarget(w, h);
+}
+window.addEventListener("resize", resizeStage);
+resizeStage();
+function clearFeedback() {
+  for (const t of [fbA, fbB]) { gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ---------------- Per-frame GPU pipeline ----------------
+function uploadMask(data, w, h, invert) {
+  ensureMaskTargets(w, h);
+  const n = w * h;
+  if (invert) for (let i = 0; i < n; i++) maskBytes[i] = 255 - data[i] * 255;
+  else for (let i = 0; i < n; i++) maskBytes[i] = data[i] * 255;
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
+}
+
+function buildField(now) {
+  // 1. Steadiness (temporal smoothing)
+  run("steady", steadyB, (a) => { a.tex("u_new", maskTex); a.tex("u_prev", steadyA.tex); a.f("u_k", S.steady); });
+  [steadyA, steadyB] = [steadyB, steadyA];
+  // 2. Blur: rounds off the stair-steps and pinholes before the edge is cut
+  let src = steadyA;
+  const passes = S.smooth > 4 ? 2 : (S.smooth > 0 ? 1 : 0);
+  const r = passes === 2 ? S.smooth * 0.42 : S.smooth * 0.6;
+  for (let i = 0; i < passes; i++) {
+    run("blur", blurTmp, (a) => { a.tex("u_src", src.tex); a.f("u_dir", r / maskW, 0); });
+    run("blur", field, (a) => { a.tex("u_src", blurTmp.tex); a.f("u_dir", 0, r / maskH); });
+    src = field;
+  }
+  if (passes === 0) {
+    run("blur", field, (a) => { a.tex("u_src", steadyA.tex); a.f("u_dir", 0, 0); });
+  }
+  // 3. Keep a short history of fields for the partner delay
+  historyHead = (historyHead + 1) % HISTORY;
+  historyCount = Math.min(historyCount + 1, HISTORY);
+  historyTime[historyHead] = now;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, field.fb);
+  gl.bindTexture(gl.TEXTURE_2D, history[historyHead]);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, maskW, maskH);
+}
+
+function pastField(now, delaySec) {
+  const target = now - delaySec * 1000;
+  let idx = historyHead;
+  for (let i = 0; i < historyCount; i++) {
+    const j = (historyHead - i + HISTORY) % HISTORY;
+    idx = j;
+    if (historyTime[j] <= target) break;
+  }
+  return history[idx];
+}
+
+function fitRect() {
+  // Fill: the camera image covers the whole screen (edges may be trimmed).
+  // Whole frame: the entire camera image fits inside the screen.
+  const sw = stage.width, sh = stage.height;
+  const s = (S.fill ? Math.max(sw / maskW, sh / maskH) : Math.min(sw / maskW, sh / maskH)) * S.size;
+  const w = (maskW * s) / sw, h = (maskH * s) / sh;
+  return [(1 - w) / 2, (1 - h) / 2, w, h];
+}
+
+let startTime = performance.now();
+let paintFrame = 0;
+function render(now) {
+  const fit = fitRect();
+  const common = (a) => {
+    a.f("u_fit", ...fit); a.f("u_mirror", S.mirror ? 1 : 0);
+    a.f("u_cut", S.cutoff); a.f("u_soft", S.soft); a.f("u_glow", S.glow);
+    a.f("u_style", { solid: 0, outline: 1, neon: 2 }[S.style] ?? 2);
+    a.f("u_line", S.line * pixelRatio); a.f("u_invert", S.invert ? 1 : 0);
+    a.tex("u_field", field.tex);
+  };
+  const t = (now - startTime) / 1000;
+
+  if (S.mode === "shadow") {
+    run("shadow", null, common);
+  } else if (S.mode === "trails" || S.mode === "paint") {
+    const trails = S.mode === "trails";
+    // decay per frame: trails fade within ~0.2–4 s; paint lingers or stays forever
+    const decay = trails ? 0.80 + 0.19 * Math.pow(S.trailLength, 0.6) : 1;
+    // 8-bit buffers can only fade one step at a time, so paint fades by skipping frames:
+    // Fade 0 = never, low = minutes, 1 = about 8 seconds.
+    paintFrame++;
+    const every = Math.round(1 + (1 - S.paintFade) * 30);
+    const sub = trails ? 1.2 / 255 : (S.paintFade > 0 && paintFrame % every === 0 ? 1 / 255 : 0);
+    const color = trails ? [0.85, 0.92, 1.0] : hueRGB(t * (0.01 + S.hueSpeed * 0.12));
+    run("feedback", fbB, (a) => {
+      common(a); a.tex("u_prev", fbA.tex);
+      a.f("u_decay", decay); a.f("u_sub", sub); a.f("u_ink", trails ? 1.0 : 0.3); a.f("u_color", ...color);
+    });
+    [fbA, fbB] = [fbB, fbA];
+    run(trails ? "trailsShow" : "paintShow", null, (a) => { common(a); a.tex("u_buf", fbA.tex); });
+  } else if (S.mode === "partner") {
+    run("partner", null, (a) => {
+      common(a);
+      a.tex("u_past", pastField(now, S.delay));
+      a.f("u_facing", S.facing ? 1 : 0); a.f("u_shift", S.shift);
+      a.f("u_pcolor", 0.45, 0.78, 1.0);
+    });
+  }
+}
+
+function hueRGB(h) {
+  h = h - Math.floor(h);
+  const k = [0, 4, 2].map((o) => Math.min(Math.max(Math.abs(((h * 6 + o) % 6) - 3) - 1, 0), 1));
+  return k.map((v) => 0.15 + 0.85 * v);
+}
+
+// ---------------- Model ----------------
+let vision = null, fileset = null, segmenter = null, switching = false;
+
+async function loadModel(key) {
+  if (!vision) vision = await import(TASKS_URL);
+  if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL);
+  const make = (delegate) => vision.ImageSegmenter.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODELS[key].url, delegate },
+    runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false
+  });
+  let seg;
+  try { seg = await make("GPU"); }
+  catch (e) { console.warn("GPU delegate failed, using CPU", e); seg = await make("CPU"); }
+  if (segmenter) segmenter.close();
+  segmenter = seg;
+}
+
+// Small frame for the model. The model works at 256 px internally anyway, and its
+// mask comes back at the size of whatever we feed it, so a small input keeps the
+// whole chain cheap. The big, crisp edge is made later on the GPU.
+const proc = document.createElement("canvas");
+const procCtx = proc.getContext("2d", { alpha: false, desynchronized: true });
+const PROC_LONG = 320;
+
+// ---------------- Camera ----------------
+let stream = null, camPortrait = null, camFps = 0;
+const isPortrait = () => window.innerHeight > window.innerWidth;
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  // Ask for a camera picture shaped like the screen, so it fills it.
+  camPortrait = isPortrait();
+  const size = camPortrait ? { width: { ideal: 480 }, height: { ideal: 640 } } : { width: { ideal: 640 }, height: { ideal: 480 } };
+  const base = { facingMode: S.facingMode, ...size };
+  try {
+    // Prefer a steady 24–30 fps; phones drop to 15 in dim light otherwise.
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { ...base, frameRate: { min: 24, ideal: 30 } } });
+  } catch (e) {
+    if (e && e.name === "NotAllowedError") throw e;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { ...base, frameRate: { ideal: 30 } } });
+  }
+  video.srcObject = stream;
+  await video.play();
+  try { camFps = Math.round(stream.getVideoTracks()[0].getSettings().frameRate || 0); } catch (e) { camFps = 0; }
+}
+// Turning the phone: restart the camera so its picture matches again.
+window.addEventListener("resize", () => {
+  if (!running || DEMO || camPortrait === null || isPortrait() === camPortrait) return;
+  clearTimeout(startCamera._t);
+  startCamera._t = setTimeout(() => startCamera().catch(console.error), 300);
+});
+
+// ---------------- Main loop ----------------
+let running = false, lastTs = 0;
+let frames = 0, fpsStart = performance.now(), segTotal = 0, workTotal = 0;
+
+function processFrame() {
+  const now = performance.now();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh || !segmenter || switching) return;
+  const k = PROC_LONG / Math.max(vw, vh);
+  const pw = Math.round(vw * k), ph = Math.round(vh * k);
+  if (proc.width !== pw || proc.height !== ph) { proc.width = pw; proc.height = ph; }
+  procCtx.drawImage(video, 0, 0, pw, ph);
+
+  const ts = Math.max(now, lastTs + 1); lastTs = ts;
+  const t0 = performance.now();
+  segmenter.segmentForVideo(proc, ts, (result) => {
+    const m = result.confidenceMasks && result.confidenceMasks[0];
+    if (!m) return;
+    uploadMask(m.getAsFloat32Array(), m.width, m.height, MODELS[S.model].invert);
+  });
+  segTotal += performance.now() - t0;
+  if (!maskW) return;
+  buildField(now);
+  render(now);
+  workTotal += performance.now() - now;
+  countFrame(now);
+}
+
+function countFrame(now) {
+  frames++;
+  if (now - fpsStart >= 1000) {
+    const fps = Math.round(frames * 1000 / (now - fpsStart));
+    const cam = camFps ? ` · camera set to ${camFps}` : "";
+    fpsEl.textContent = `${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}`;
+    frames = 0; segTotal = 0; workTotal = 0; fpsStart = now;
+  }
+}
+
+// Run once per new camera frame when the browser supports it (lowest lag);
+// otherwise poll on each display refresh.
+function loop() {
+  if (!running) return;
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+    const onFrame = () => { if (!running) return; processFrame(); video.requestVideoFrameCallback(onFrame); };
+    video.requestVideoFrameCallback(onFrame);
+  } else {
+    let lastTime = -1;
+    const onRaf = () => {
+      if (!running) return;
+      if (video.currentTime !== lastTime) { lastTime = video.currentTime; processFrame(); }
+      requestAnimationFrame(onRaf);
+    };
+    requestAnimationFrame(onRaf);
+  }
+}
+
+// ---------------- Demo source (for testing without a camera or model) ----------------
+// A simple figure that dances, rendered into a mask. Open the page with ?demo.
+function demoMask(t, w, h) {
+  procCtx.fillStyle = "#000"; procCtx.fillRect(0, 0, w, h);
+  procCtx.fillStyle = "#fff"; procCtx.strokeStyle = "#fff"; procCtx.lineCap = "round";
+  const cx = w * (0.5 + 0.18 * Math.sin(t * 0.7)), cy = h * 0.5;
+  const u = h / 10;
+  procCtx.beginPath(); procCtx.arc(cx, cy - 3.2 * u, 0.7 * u, 0, Math.PI * 2); procCtx.fill();
+  procCtx.lineWidth = 1.3 * u;
+  const limb = (x0, y0, a1, l1, a2, l2) => {
+    const x1 = x0 + Math.sin(a1) * l1, y1 = y0 + Math.cos(a1) * l1;
+    const x2 = x1 + Math.sin(a2) * l2, y2 = y1 + Math.cos(a2) * l2;
+    procCtx.beginPath(); procCtx.moveTo(x0, y0); procCtx.lineTo(x1, y1); procCtx.lineTo(x2, y2); procCtx.stroke();
+  };
+  procCtx.beginPath(); procCtx.moveTo(cx, cy - 2.2 * u); procCtx.lineTo(cx, cy + 0.6 * u); procCtx.lineWidth = 1.7 * u; procCtx.stroke();
+  procCtx.lineWidth = 0.75 * u;
+  const s = Math.sin(t * 2.2), c = Math.cos(t * 1.6);
+  limb(cx, cy - 2.0 * u, Math.PI * (0.55 + 0.35 * s), 1.4 * u, Math.PI * (0.75 + 0.4 * c), 1.3 * u);
+  limb(cx, cy - 2.0 * u, -Math.PI * (0.55 - 0.35 * c), 1.4 * u, -Math.PI * (0.8 + 0.3 * s), 1.3 * u);
+  procCtx.lineWidth = 0.95 * u;
+  limb(cx, cy + 0.6 * u, 0.25 + 0.3 * s, 1.8 * u, 0.1 + 0.2 * s, 1.8 * u);
+  limb(cx, cy + 0.6 * u, -0.25 + 0.3 * c, 1.8 * u, -0.1 - 0.2 * c, 1.8 * u);
+  const img = procCtx.getImageData(0, 0, w, h).data;
+  const out = new Float32Array(w * h);
+  for (let i = 0; i < out.length; i++) out[i] = img[i * 4] / 255;
+  // add a little edge noise, like a real model
+  for (let i = 0; i < out.length; i++) if (out[i] > 0 && out[i] < 1) out[i] = Math.min(1, Math.max(0, out[i] + (Math.random() - 0.5) * 0.6));
+  return out;
+}
+function demoLoop() {
+  const w = 320, h = 240;
+  proc.width = w; proc.height = h;
+  const tick = () => {
+    if (!running) return;
+    const now = performance.now();
+    const t0 = performance.now();
+    uploadMask(demoMask(now / 1000, w, h), w, h, false);
+    segTotal += performance.now() - t0;
+    buildField(now); render(now); workTotal += performance.now() - now; countFrame(now);
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+// ---------------- Keep the screen awake ----------------
+async function keepAwake() { try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {} }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && running) keepAwake(); });
+
+// ---------------- UI ----------------
+function fmt(key, v) {
+  if (key === "smooth" || key === "line") return v.toFixed(1);
+  if (key === "delay") return v.toFixed(2);
+  return v.toFixed(2);
+}
+function syncUI() {
+  document.querySelectorAll("#modes button").forEach((b) => b.classList.toggle("on", b.dataset.mode === S.mode));
+  document.querySelectorAll(".section[data-for]").forEach((sec) => { sec.hidden = sec.dataset.for !== S.mode; });
+  document.querySelectorAll("input[data-key]").forEach((inp) => {
+    inp.value = S[inp.dataset.key];
+    inp.nextElementSibling.textContent = fmt(inp.dataset.key, +S[inp.dataset.key]);
+  });
+  $("mirrorBtn").classList.toggle("on", S.mirror);
+  document.querySelectorAll("#styles button[data-style]").forEach((b) => b.classList.toggle("on", b.dataset.style === S.style));
+  $("invertBtn").classList.toggle("on", S.invert);
+  $("fillBtn").classList.toggle("on", S.fill);
+  $("fillBtn").textContent = S.fill ? "Fill screen" : "Whole frame";
+  $("facingBtn").classList.toggle("on", S.facing);
+  $("facingBtn").textContent = S.facing ? "Facing me" : "Same direction";
+  $("modelBtn").textContent = "Model: " + MODELS[S.model].label;
+}
+
+document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("click", () => {
+  S.mode = b.dataset.mode; save(); syncUI();
+  if (S.mode === "trails" || S.mode === "paint") clearFeedback();
+}));
+document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListener("input", () => {
+  S[inp.dataset.key] = parseFloat(inp.value);
+  inp.nextElementSibling.textContent = fmt(inp.dataset.key, S[inp.dataset.key]);
+  save();
+}));
+$("clearBtn").addEventListener("click", clearFeedback);
+document.querySelectorAll("#styles button[data-style]").forEach((b) => b.addEventListener("click", () => { S.style = b.dataset.style; save(); syncUI(); }));
+$("invertBtn").addEventListener("click", () => { S.invert = !S.invert; save(); syncUI(); });
+$("fillBtn").addEventListener("click", () => { S.fill = !S.fill; save(); syncUI(); });
+$("facingBtn").addEventListener("click", () => { S.facing = !S.facing; save(); syncUI(); });
+$("mirrorBtn").addEventListener("click", () => { S.mirror = !S.mirror; save(); syncUI(); });
+$("flipBtn").addEventListener("click", async () => {
+  S.facingMode = S.facingMode === "user" ? "environment" : "user";
+  S.mirror = S.facingMode === "user";
+  save(); syncUI();
+  if (!DEMO) { try { await startCamera(); } catch (e) { console.error(e); } }
+});
+$("modelBtn").addEventListener("click", async () => {
+  if (DEMO) return;
+  const next = S.model === "fast" ? "quality" : "fast";
+  const btn = $("modelBtn"); btn.disabled = true; btn.textContent = "Loading…";
+  switching = true;
+  try { await loadModel(next); S.model = next; save(); } catch (e) { console.error(e); }
+  switching = false; btn.disabled = false; syncUI();
+});
+$("fullBtn").addEventListener("click", () => {
+  const el = document.documentElement;
+  if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+  else (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+});
+$("resetBtn").addEventListener("click", () => {
+  const keep = { facingMode: S.facingMode, model: S.model, mode: S.mode, style: S.style };
+  S = { ...DEFAULTS, ...keep, mirror: keep.facingMode === "user" }; save(); syncUI();
+});
+stage.addEventListener("click", () => {
+  if (!running) return;
+  controls.classList.toggle("show"); fpsEl.classList.toggle("show");
+});
+syncUI();
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+  if (DEMO) {
+    intro.style.display = "none"; controls.classList.add("show"); fpsEl.classList.add("show");
+    running = true; demoLoop(); return;
+  }
+  statusEl.textContent = "Starting camera…";
+  try {
+    await startCamera();
+    intro.style.display = "none"; controls.classList.add("show"); fpsEl.classList.add("show");
+    running = true; keepAwake(); loop();
+  } catch (e) {
+    console.error(e);
+    startBtn.disabled = false;
+    statusEl.textContent = (e && e.name === "NotAllowedError")
+      ? "Camera permission was blocked. Allow it in the browser settings and try again."
+      : "Could not open the camera. This page has to be opened from an https link.";
+  }
+});
+
+if (DEMO) { statusEl.textContent = "Demo mode (no camera)"; startBtn.disabled = false; }
+else {
+  loadModel(S.model)
+    .then(() => { statusEl.textContent = "Ready"; startBtn.disabled = false; })
+    .catch((e) => { console.error(e); statusEl.textContent = "Could not load the body-tracking model. Check the connection and reload."; });
+}
+
+// Expose a tiny hook for automated testing.
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); } };
+</script>
+</body>
+</html>
