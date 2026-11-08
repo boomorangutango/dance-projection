@@ -47,7 +47,10 @@
   }
   #controls.show { display: flex; }
   .modes, .styles, .looks { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-  .modes, .looks { grid-template-columns: repeat(5, 1fr); }
+  .looks { grid-template-columns: repeat(5, 1fr); }
+  .modes { grid-template-columns: repeat(6, 1fr); }
+  #ribbon { position: fixed; left: 0; top: 0; width: 100vw; height: max(90px, 18vh); pointer-events: none; display: none; }
+  #ribbon.bottom { top: auto; bottom: 0; }
   .worlds { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .worlds button { font-size: 12px; padding: 9px 2px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d0d; color: var(--fg); }
   .worlds button.on { border-color: var(--fg); background: #222; }
@@ -109,6 +112,7 @@
     <button data-mode="paint">Paint</button>
     <button data-mode="partner">Partner</button>
     <button data-mode="field">Field</button>
+    <button data-mode="tap">Tap</button>
   </div>
 
   <div class="section">
@@ -189,6 +193,22 @@
     <label class="slider" id="returnRow"><span id="returnLabel">Return</span> <input data-key="springBack" type="range" min="0" max="2" step="0.1"><span></span></label>
     <div class="row" id="clearWorldRow"><button id="clearWorldBtn">Start over</button></div>
   </div>
+  <div class="section" data-for="tap">
+    <div class="row">
+      <button id="metroBtn">Metronome: off</button>
+      <button id="clickBtn">Click sound: off</button>
+    </div>
+    <label class="slider">Tempo <input data-key="tapBpm" type="range" min="60" max="200" step="1"><span></span></label>
+    <div class="row">
+      <button id="echoBtn">Echo</button>
+      <button id="ribbonBtn">Ribbon</button>
+      <button id="figureBtn">Figure</button>
+      <button id="heelToeBtn">Heel/toe</button>
+    </div>
+    <div class="row"><button id="ribbonPosBtn">Ribbon at the top</button></div>
+    <label class="slider">Tap sensitivity <input data-key="tapSens" type="range" min="0.5" max="2" step="0.05"><span></span></label>
+    <div class="hint" style="text-align:left">Tap mode listens through the microphone. Put the phone low, near the floor. Without the metronome it uses the song's beat once it hears one.</div>
+  </div>
   <div class="section" data-for="partner">
     <label class="slider">Delay (sec) <input data-key="delay" type="range" min="0.1" max="3" step="0.05"><span></span></label>
     <label class="slider">Shift <input data-key="shift" type="range" min="-0.5" max="0.5" step="0.01"><span></span></label>
@@ -232,7 +252,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v12";
+const APP_VERSION = "v13";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -264,6 +284,7 @@ const DEFAULTS = {
   look: "smooth",
   musicAmt: 1, beatSens: 1.25, partnerBeats: 0,
   auto: "off", autoBy: "music", autoSecs: 30, scheme: "natural",
+  tapBpm: 100, ribbonBottom: false, metro: false, metroClick: false, tapEcho: true, tapRibbon: true, tapFigure: true, heelToe: false, tapSens: 1,
   world: "dots", fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
   trailLength: 0.6,
@@ -694,7 +715,7 @@ function processMask(p, w, h, poses, rect) {
   gl.bindTexture(gl.TEXTURE_2D, cropTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, cropBytes);
   run("place", rawFull, (a) => { a.tex("u_crop", cropTex); a.f("u_rect", rect.x, rect.y, rect.w, rect.h); });
-  if (S.mode === "field") { buildGrid(cropBytes, w, h, rect); blurGrid(); }
+  if (S.mode === "field" || S.mode === "tap") { buildGrid(cropBytes, w, h, rect); blurGrid(); }
   updateRoi(bx1 >= 0 ? { x0: bx0, x1: bx1, y0: by0, y1: by1 } : null, w, h, rect);
 }
 
@@ -847,67 +868,87 @@ const M = {
 // high with simple filters, measures each every ~6 ms, and reports beats the
 // moment they happen, however busy the page is.
 const WORKLET_SRC = `
+// Runs on the audio thread. Every 4 ms: measures five bands, reports beats
+// (kick-led rises) and taps (sharp, bright clicks), timed on the audio clock.
 class Listen extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.f = [0, 0, 0, 0];               // one-pole low-passes at 40, 130, 300, 2000 Hz
-    this.acc = [0, 0, 0, 0]; this.n = 0;
-    this.hop = Math.round(sampleRate * 0.006);
+    this.f = [0, 0, 0, 0, 0];                       // low-passes at 40, 130, 300, 2000, 5000 Hz
+    this.acc = [0, 0, 0, 0, 0]; this.n = 0;
+    this.hop = Math.round(sampleRate * 0.004);
+    // beats
     this.es = [0, 0, 0, 0]; this.ref = [-9, -9, -9, -9];
-    this.hist = []; this.t = 0; this.lastBeat = -1; this.prev = 0; this.prevThr = 0;
-    this.L = new Float32Array(500); this.Li = 0; this.Ln = 0; this.floor = 0; this.sinceFloor = 0;
-    this.sendAcc = [0, 0, 0]; this.sendN = 0; this.sens = 1.25;
-    this.port.onmessage = (m) => { if (m.data && m.data.sens) this.sens = m.data.sens; };
+    this.hist = []; this.lastBeat = -1; this.prev = 0; this.prevThr = 0;
+    this.L = new Float32Array(750); this.Li = 0; this.Ln = 0; this.floor = 0; this.sinceFloor = 0;
+    // taps
+    this.tes = 0; this.tref = -9; this.thist = []; this.tprev = 0; this.tprevThr = 0; this.lastTap = -1;
+    this.TL = new Float32Array(750); this.TLi = 0; this.TLn = 0; this.tfloor = 0;
+    this.pk = [0, 0];
+    this.sendAcc = [0, 0, 0]; this.sendN = 0; this.sens = 1.25; this.tsens = 1;
+    this.port.onmessage = (m) => { if (m.data) { if (m.data.sens) this.sens = m.data.sens; if (m.data.tsens) this.tsens = m.data.tsens; } };
   }
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
     if (!ch) return true;
-    const a = [40, 130, 300, 2000].map((hz) => 1 - Math.exp(-2 * Math.PI * hz / sampleRate));
-    const f = this.f;
+    const a = [40, 130, 300, 2000, 5000].map((hz) => 1 - Math.exp(-2 * Math.PI * hz / sampleRate));
+    const f = this.f, acc = this.acc;
     for (let i = 0; i < ch.length; i++) {
       const x = ch[i];
-      for (let k = 0; k < 4; k++) f[k] += a[k] * (x - f[k]);
-      const kick = f[1] - f[0];            // 40–130 Hz: kick drum
-      const bass = f[2] - f[1];            // 130–300 Hz
-      const mid = f[3] - f[2], high = x - f[3];
-      this.acc[0] += kick * kick; this.acc[1] += bass * bass; this.acc[2] += mid * mid; this.acc[3] += high * high;
+      for (let k = 0; k < 5; k++) f[k] += a[k] * (x - f[k]);
+      const kick = f[1] - f[0], bass = f[2] - f[1], mid = f[3] - f[2], high = x - f[3], vh = x - f[4];
+      acc[0] += kick * kick; acc[1] += bass * bass; acc[2] += mid * mid; acc[3] += high * high; acc[4] += vh * vh;
       if (++this.n >= this.hop) this.frame();
     }
     return true;
   }
+  pct10(buf, n) { const s = Array.from(buf.subarray(0, n)).sort((x, y) => x - y); return s[Math.floor(s.length * 0.1)] || 0; }
   frame() {
     const e = this.acc.map((v) => v / this.n);
-    this.acc = [0, 0, 0, 0]; this.n = 0; this.t += this.hop / sampleRate;
-    for (let k = 0; k < 4; k++) this.es[k] += (e[k] - this.es[k]) * 0.45;   // ~12 ms smoothing
-    // onset: rise of each band above its recent level (dB/10). Kick counts most.
+    this.acc = [0, 0, 0, 0, 0]; this.n = 0;
+    const t = currentTime;
+    this.sinceFloor++;
+    // ---- beats ----
+    for (let k = 0; k < 4; k++) this.es[k] += (e[k] - this.es[k]) * 0.33;
     const w = [3.0, 1.2, 0.8, 0.3];
     let on = 0;
     for (let k = 0; k < 4; k++) {
       const lg = Math.log10(this.es[k] + 1e-11);
       on += Math.max(0, lg - this.ref[k]) * w[k];
-      this.ref[k] += (lg - this.ref[k]) * 0.12;
+      this.ref[k] += (lg - this.ref[k]) * 0.085;
     }
-    const H = this.hist; H.push(on); if (H.length > 170) H.shift();
+    const H = this.hist; H.push(on); if (H.length > 250) H.shift();
     let mean = 0; for (const v of H) mean += v; mean /= H.length;
     let vr = 0; for (const v of H) vr += (v - mean) * (v - mean);
-    const sd = Math.sqrt(vr / H.length);
-    const thr = Math.max(0.3 / this.sens, mean + (1.8 / this.sens) * sd);
-    // quiet level between hits (10th percentile of the last 3 s), so hiss alone never counts
+    const thr = Math.max(0.3 / this.sens, mean + (1.8 / this.sens) * Math.sqrt(vr / H.length));
     const loud = this.es[0] + this.es[1] + this.es[2];
     this.L[this.Li] = loud; this.Li = (this.Li + 1) % this.L.length; this.Ln = Math.min(this.Ln + 1, this.L.length);
-    if (++this.sinceFloor >= 40) {
-      this.sinceFloor = 0;
-      const s = Array.from(this.L.subarray(0, this.Ln)).sort((x, y) => x - y);
-      this.floor = s[Math.floor(s.length * 0.1)];
+    // ---- taps: rise of the bright band (2 kHz+) above its last ~60 ms ----
+    this.tes += (e[3] - this.tes) * 0.75;
+    const lt = Math.log10(this.tes + 1e-12);
+    const ton = Math.max(0, lt - this.tref);
+    this.tref += (lt - this.tref) * 0.07;
+    const TH = this.thist; TH.push(ton); if (TH.length > 250) TH.shift();
+    let tm = 0; for (const v of TH) tm += v; tm /= TH.length;
+    let tv = 0; for (const v of TH) tv += (v - tm) * (v - tm);
+    const tthr = Math.max(0.35 / this.tsens, tm + (2.2 / this.tsens) * Math.sqrt(tv / TH.length));
+    this.TL[this.TLi] = this.tes; this.TLi = (this.TLi + 1) % this.TL.length; this.TLn = Math.min(this.TLn + 1, this.TL.length);
+    if (this.sinceFloor >= 60) { this.sinceFloor = 0; this.floor = this.pct10(this.L, this.Ln); this.tfloor = this.pct10(this.TL, this.TLn); }
+
+    if (H.length > 90 && this.prev > this.prevThr && on < this.prev && t - this.lastBeat > 0.28 && loud > this.floor * 1.6 && loud > 1e-8) {
+      this.lastBeat = t;
+      this.port.postMessage({ beat: Math.min(1, 0.45 + 0.5 * (this.prev - this.prevThr) / (this.prevThr + 1e-6)), t: t - 0.004 });
     }
-    if (H.length > 60 && this.prev > this.prevThr && on < this.prev && this.t - this.lastBeat > 0.28 &&
-        loud > this.floor * 1.6 && loud > 1e-8) {
-      this.lastBeat = this.t;
-      this.port.postMessage({ beat: Math.min(1, 0.45 + 0.5 * (this.prev - this.prevThr) / (this.prevThr + 1e-6)), t: this.t });
+    if (TH.length > 90 && this.tprev > this.tprevThr && ton < this.tprev && t - this.lastTap > 0.07 && this.pk[0] > this.tfloor * 4 && this.pk[0] > 1e-9) {
+      this.lastTap = t;
+      this.port.postMessage({
+        tap: Math.min(1, 0.4 + 0.6 * (this.tprev - this.tprevThr) / (this.tprevThr + 1e-6)),
+        bright: this.pk[1] / (this.pk[0] + 1e-12),   // share of the click above 5 kHz (toe taps tend to be brighter)
+        t: t - 0.004
+      });
     }
-    this.prev = on; this.prevThr = thr;
+    this.prev = on; this.prevThr = thr; this.tprev = ton; this.tprevThr = tthr; this.pk = [this.tes, e[4]];
     this.sendAcc[0] += e[0] + e[1]; this.sendAcc[1] += e[2]; this.sendAcc[2] += e[3];
-    if (++this.sendN >= 4) { this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)), t: this.t }); this.sendAcc = [0, 0, 0]; this.sendN = 0; }
+    if (++this.sendN >= 6) { this.port.postMessage({ lv: this.sendAcc.map((v) => Math.sqrt(v / this.sendN)), t }); this.sendAcc = [0, 0, 0]; this.sendN = 0; }
   }
 }
 registerProcessor("listen", Listen);`;
@@ -935,6 +976,7 @@ function onWorklet(msg) {
     }
     if (now / 1000 - M.lastBeatWall > 4) { M.period = 0; M.bpm = 0; M.gridT = 0; }
   }
+  if (d.tap) onTap(d);
   if (d.beat) {
     M.lastStrength = d.beat; M.beat = d.beat; M.beatCount++; M.lastBeatWall = now / 1000;
     M.beats.push(d.t); while (M.beats.length && d.t - M.beats[0] > 12) M.beats.shift();
@@ -965,7 +1007,7 @@ async function startMusic() {
     src.connect(node); node.connect(mute); mute.connect(M.ctx.destination);
     node.port.onmessage = onWorklet;
     M.node = node; M.src = src; M.worklet = true;
-    node.port.postMessage({ sens: S.beatSens });
+    node.port.postMessage({ sens: S.beatSens, tsens: S.tapSens });
   } catch (e) {
     console.warn("AudioWorklet unavailable, using the analyser fallback", e);
     M.an = M.ctx.createAnalyser(); M.an.fftSize = 2048; M.an.smoothingTimeConstant = 0;
@@ -1741,6 +1783,257 @@ function renderField(now, fit, common, t) {
   }
 }
 
+// ---------------- Tap mode ----------------
+// Taps come from the audio thread with their exact time on the audio clock.
+// They light up the foot that just moved, get echoed one bar later, and are
+// drawn on a scrolling ribbon against the beat grid (song tempo or metronome).
+const T = {
+  log: [],            // {t, s, bright, toe, off, on, graded}
+  queue: [],          // new taps waiting to be drawn as bursts
+  echoes: [],         // {at, x, y, s, toe}
+  feet: [null, null], footMove: [0, 0], prevFeet: [null, null],
+  metroStart: 0, nextClick: 0, clickTimer: 0, clicks: [],
+  brightMed: 0.25, brights: [], streak: 0, best: 0,
+  parts: null
+};
+
+function audioNow() { return M.ctx ? M.ctx.currentTime : performance.now() / 1000; }
+
+// Beat grid: the metronome if it's on, otherwise the song's tempo once it's known.
+function tapGrid() {
+  if (S.metro && T.metroStart) return { period: 60 / S.tapBpm, anchor: T.metroStart, bar: true };
+  if (M.on && M.period && M.beats.length >= 4) {
+    // anchor the grid to the typical timing of the last 16 beats, so one stray
+    // detection doesn't shift it: median of each beat's position within the beat
+    const p = M.period, B = M.beats.slice(-16), ref = B[B.length - 1];
+    const r = B.map((b) => { let x = ((b - ref) / p) % 1; if (x < -0.5) x += 1; if (x >= 0.5) x -= 1; return x; }).sort((a, b) => a - b);
+    return { period: p, anchor: ref + r[r.length >> 1] * p, bar: false };
+  }
+  return null;
+}
+// How far a tap is from the nearest 16th note (seconds, signed) and whether it counts as on.
+function gradeTap(tap) {
+  const g = tapGrid(); if (!g) { tap.off = null; tap.on = null; return; }
+  const sub = g.period / 4;
+  const k = Math.round((tap.t - g.anchor) / sub);
+  tap.off = tap.t - (g.anchor + k * sub);
+  tap.on = Math.abs(tap.off) <= Math.max(0.03, sub * 0.22);
+}
+
+function onTap(d) {
+  // ignore our own metronome clicks
+  if (S.metro && S.metroClick && T.clicks.some((c) => Math.abs(d.t - c) < 0.035)) return;
+  if (S.mode !== "tap") return;
+  const tap = { t: d.t, s: d.tap, bright: d.bright };
+  // heel or toe: brighter than the middle of the last 40 taps counts as toe
+  T.brights.push(d.bright); if (T.brights.length > 40) T.brights.shift();
+  // split the recent values into two natural groups (whichever cut separates them best)
+  const sorted = [...T.brights].sort((x, y) => x - y);
+  if (sorted.length >= 8) {
+    let bestCut = sorted[sorted.length >> 1], bestScore = -1, sumL = 0;
+    const total = sorted.reduce((a, b) => a + b, 0);
+    for (let i = 1; i < sorted.length; i++) {
+      sumL += sorted[i - 1];
+      const nL = i, nR = sorted.length - i, mL = sumL / nL, mR = (total - sumL) / nR;
+      const score = nL * nR * (mL - mR) * (mL - mR);
+      if (score > bestScore) { bestScore = score; bestCut = (sorted[i - 1] + sorted[i]) / 2; }
+    }
+    T.brightMed = bestCut;
+  } else T.brightMed = d.bright;
+  tap.toe = d.bright > T.brightMed;
+  gradeTap(tap);
+  if (tap.on === true) { T.streak++; T.best = Math.max(T.best, T.streak); } else if (tap.on === false) T.streak = 0;
+  T.log.push(tap); while (T.log.length && d.t - T.log[0].t > 12) T.log.shift();
+  T.queue.push(tap);
+}
+
+// ---- metronome (optional audible click, scheduled ahead on the audio clock) ----
+function startMetro() {
+  T.metroStart = audioNow() + 0.15; T.nextClick = T.metroStart; T.clicks = [];
+  clearInterval(T.clickTimer);
+  T.clickTimer = setInterval(() => {
+    if (!S.metro || !M.ctx) return;
+    const now = audioNow(), p = 60 / S.tapBpm;
+    while (T.nextClick < now + 0.12) {
+      const beatIdx = Math.round((T.nextClick - T.metroStart) / p);
+      if (S.metroClick) {
+        const o = M.ctx.createOscillator(), g = M.ctx.createGain();
+        o.frequency.value = beatIdx % 4 === 0 ? 1760 : 1320;
+        g.gain.setValueAtTime(0.0001, T.nextClick);
+        g.gain.exponentialRampToValueAtTime(0.35, T.nextClick + 0.002);
+        g.gain.exponentialRampToValueAtTime(0.0001, T.nextClick + 0.04);
+        o.connect(g); g.connect(M.ctx.destination); o.start(T.nextClick); o.stop(T.nextClick + 0.05);
+      }
+      T.clicks.push(T.nextClick); if (T.clicks.length > 8) T.clicks.shift();
+      T.nextClick += p;
+    }
+  }, 25);
+}
+function stopMetro() { clearInterval(T.clickTimer); T.metroStart = 0; }
+
+// ---- feet: the lowest part of the body map, split into left and right ----
+function findFeet(fit) {
+  if (!gridSoft || !gridHasBody) { T.feet = [null, null]; return; }
+  let top = gridH, bot = -1;
+  for (let y = 0; y < gridH; y++) for (let x = 0; x < gridW; x++) if (gridSoft[y * gridW + x] > 0.5) { if (y < top) top = y; if (y > bot) bot = y; }
+  if (bot < 0) { T.feet = [null, null]; return; }
+  const band = Math.max(2, Math.round((bot - top) * 0.12));
+  // centre line of the lower body
+  let sx = 0, n = 0;
+  for (let y = bot - band; y <= bot; y++) for (let x = 0; x < gridW; x++) if (gridSoft[y * gridW + x] > 0.5) { sx += x; n++; }
+  if (!n) { T.feet = [null, null]; return; }
+  const mid = sx / n;
+  const acc = [[0, 0, 0, -1], [0, 0, 0, -1]];   // sumx, sumy, count, lowest y
+  for (let y = bot - band; y <= bot; y++) for (let x = 0; x < gridW; x++) {
+    if (gridSoft[y * gridW + x] <= 0.5) continue;
+    const a = acc[x < mid ? 0 : 1]; a[0] += x; a[1] += y; a[2]++; if (y > a[3]) a[3] = y;
+  }
+  for (let k = 0; k < 2; k++) {
+    const a = acc[k];
+    if (!a[2]) { T.feet[k] = null; continue; }
+    const [sx2, sy2] = frameToScreen((a[0] / a[2] + 0.5) / gridW, (a[3] + 0.5) / gridH, fit);
+    const prev = T.feet[k];
+    if (prev) T.footMove[k] = T.footMove[k] * 0.6 + Math.hypot(sx2 - prev[0], sy2 - prev[1]);
+    T.feet[k] = [sx2, sy2];
+  }
+}
+function tapFoot() {
+  const [a, b] = T.feet;
+  if (a && b) return T.footMove[0] >= T.footMove[1] ? a : b;
+  return a || b || [stage.width / 2, stage.height * 0.85];
+}
+
+// ---- bursts ----
+function initTapParts() {
+  const max = 4000;
+  return { max, n: 0, pos: new Float32Array(max * 2), vel: new Float32Array(max * 2), life: new Float32Array(max), span: new Float32Array(max), kind: new Uint8Array(max), gl0: new Float32Array(max * 3), gl1: new Float32Array(max * 3) };
+}
+function burst(x, y, s, toe, echo) {
+  const P = T.parts, W = stage.width, H = stage.height;
+  const ring = Math.round(26 + 26 * s), sp = W * (0.18 + 0.35 * s) * (echo ? 0.8 : 1);
+  const kind = echo ? 2 : (S.heelToe && !toe ? 1 : 0);
+  for (let i = 0; i < ring && P.n < P.max; i++) {            // a flat ring along the floor
+    const a = (i / ring) * Math.PI * 2, k = P.n++;
+    P.pos[2 * k] = x; P.pos[2 * k + 1] = y;
+    P.vel[2 * k] = Math.cos(a) * sp; P.vel[2 * k + 1] = Math.sin(a) * sp * 0.35;
+    P.span[k] = P.life[k] = 0.45 + 0.2 * s; P.kind[k] = kind;
+  }
+  const sparks = Math.round(10 + 18 * s);
+  for (let i = 0; i < sparks && P.n < P.max; i++) {           // and a spray upward
+    const k = P.n++, a = -Math.PI / 2 + (rand() - 0.5) * 1.6, v = H * (0.3 + rand() * 0.6) * (0.5 + s);
+    P.pos[2 * k] = x; P.pos[2 * k + 1] = y;
+    P.vel[2 * k] = Math.cos(a) * v; P.vel[2 * k + 1] = Math.sin(a) * v;
+    P.span[k] = P.life[k] = 0.4 + rand() * 0.5; P.kind[k] = kind;
+  }
+}
+function stepTapParts(dt) {
+  const P = T.parts, H = stage.height, drag = Math.exp(-2.5 * dt);
+  let k = 0, n0 = 0, n1 = 0;
+  for (let i = 0; i < P.n; i++) {
+    const life = P.life[i] - dt; if (life <= 0) continue;
+    const vx = P.vel[2 * i] * drag, vy = (P.vel[2 * i + 1] + H * 1.2 * dt) * drag;
+    const x = P.pos[2 * i] + vx * dt, y = P.pos[2 * i + 1] + vy * dt;
+    P.pos[2 * k] = x; P.pos[2 * k + 1] = y; P.vel[2 * k] = vx; P.vel[2 * k + 1] = vy;
+    P.life[k] = life; P.span[k] = P.span[i]; P.kind[k] = P.kind[i];
+    const v = life / P.span[k];
+    if (P.kind[k] === 1) { P.gl1[3 * n1] = cx(x); P.gl1[3 * n1 + 1] = cy(y); P.gl1[3 * n1 + 2] = v; n1++; }   // heel: warm
+    else { P.gl0[3 * n0] = cx(x); P.gl0[3 * n0 + 1] = cy(y); P.gl0[3 * n0 + 2] = (P.kind[k] === 2 ? 0.55 : 1.2) * v; n0++; } // toe / echo: cool
+    k++;
+  }
+  P.n = k;
+  drawPoints(null, P.gl0, n0, Math.max(2, 3.4 * pixelRatio), 4, 0.5);
+  drawPoints(null, P.gl1, n1, Math.max(2, 3.4 * pixelRatio), 1, 0.5);
+}
+
+function renderTap(now, fit, common) {
+  frameDt = Math.min(0.15, Math.max(0.02, (now - (lastFrameT || now - 50)) / 1000)); lastFrameT = now;
+  if (!T.parts) T.parts = initTapParts();
+  if (S.tapFigure) run("shadow", null, common);
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, stage.width, stage.height); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+  findFeet(fit);
+  const aNow = audioNow(), g = tapGrid();
+  for (const tap of T.queue) {
+    const [x, y] = tapFoot();
+    burst(x, y, tap.s, tap.toe, false);
+    if (S.tapEcho) T.echoes.push({ at: tap.t + (g ? g.period * 4 : 2), x: stage.width - x, y, s: tap.s, toe: tap.toe });
+  }
+  T.queue.length = 0;
+  T.echoes = T.echoes.filter((e) => { if (aNow >= e.at) { burst(e.x, e.y, e.s * 0.8, e.toe, true); return false; } return true; });
+  stepTapParts(frameDt);
+  drawRibbon(aNow, g);
+}
+
+// ---- the ribbon (2D overlay along the bottom) ----
+const ribbon = document.createElement("canvas");
+ribbon.id = "ribbon";
+document.body.insertBefore(ribbon, $("fader"));
+const rctx = ribbon.getContext("2d");
+function hideRibbon() { ribbon.style.display = "none"; }
+function drawRibbon(now, g) {
+  if (!S.tapRibbon) { hideRibbon(); return; }
+  ribbon.style.display = "block";
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const Wc = Math.round(window.innerWidth * dpr), Hc = Math.round(Math.max(90, window.innerHeight * 0.2) * dpr);
+  if (ribbon.width !== Wc || ribbon.height !== Hc) { ribbon.width = Wc; ribbon.height = Hc; }
+  const c = rctx, W = Wc, H = Hc, nowX = W * 0.86, span = 4, pxs = (W * 0.82) / span;
+  const X = (t) => nowX - (now - t) * pxs;
+  const sc = currentScheme, onCol = sc ? rgb(sc[2]) : "#7dffb5", offCol = "#ffb14a", gridCol = sc ? sc[1] : [0.6, 0.75, 1];
+  c.clearRect(0, 0, W, H);
+  const top = !S.ribbonBottom;
+  ribbon.classList.toggle("bottom", !top);
+  const grad = c.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(top ? 1 : 0, "rgba(0,0,0,0)"); grad.addColorStop(top ? 0.65 : 0.35, "rgba(10,14,22,0.85)"); grad.addColorStop(top ? 0 : 1, "rgba(10,14,22,0.95)");
+  c.fillStyle = grad; c.fillRect(0, 0, W, H);
+  const mid = top ? H * 0.55 : H * 0.62, lane = H * 0.2;
+  // grid: 16ths faint, beats brighter, bars brightest
+  if (g) {
+    const sub = g.period / 4;
+    const k0 = Math.ceil((now - span - g.anchor) / sub), k1 = Math.floor((now + 0.6 - g.anchor) / sub);
+    for (let k = k0; k <= k1; k++) {
+      const t = g.anchor + k * sub, x = X(t);
+      const isBeat = k % 4 === 0, isBar = g.bar && ((k / 4) % 4 + 4) % 4 === 0 && isBeat;
+      c.strokeStyle = `rgba(${gridCol.map((v) => Math.round(v * 255)).join(",")},${isBar ? 0.75 : isBeat ? 0.45 : 0.14})`;
+      c.lineWidth = (isBar ? 2.5 : isBeat ? 1.6 : 1) * dpr;
+      c.beginPath(); c.moveTo(x, mid - lane * (isBeat ? 1.25 : 0.8)); c.lineTo(x, mid + lane * (isBeat ? 1.25 : 0.8)); c.stroke();
+    }
+  }
+  // now line
+  c.strokeStyle = "rgba(255,255,255,0.8)"; c.lineWidth = 2 * dpr;
+  c.beginPath(); c.moveTo(nowX, mid - lane * 1.6); c.lineTo(nowX, mid + lane * 1.6); c.stroke();
+  // taps
+  for (const tap of T.log) {
+    const x = X(tap.t); if (x < 0) continue;
+    const y = S.heelToe ? mid + (tap.toe ? -lane * 0.55 : lane * 0.55) : mid;
+    const r = (3 + 5 * tap.s) * dpr;
+    const col = tap.on === null || tap.on === undefined ? "#ffffff" : tap.on ? onCol : offCol;
+    if (tap.on === false && g) {          // short line back to where the beat was
+      c.strokeStyle = offCol; c.lineWidth = 1.5 * dpr;
+      c.beginPath(); c.moveTo(x, y); c.lineTo(X(tap.t - tap.off), y); c.stroke();
+    }
+    c.fillStyle = col; c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+  }
+  // metronome count (1 2 3 4)
+  if (g) {
+    const beatIdx = Math.floor((now - g.anchor) / g.period + 1e-6), inBeat = ((now - g.anchor) / g.period) % 1;
+    c.font = `${Math.round(16 * dpr)}px -apple-system, system-ui, sans-serif`; c.textAlign = "center";
+    for (let i = 0; i < 4; i++) {
+      const cur = ((beatIdx % 4) + 4) % 4 === i;
+      c.fillStyle = cur ? `rgba(255,255,255,${1 - inBeat * 0.6})` : "rgba(255,255,255,0.25)";
+      c.fillText(String(i + 1), W - (4 - i) * 26 * dpr - 10 * dpr, top ? H * 0.9 : H * 0.24);
+    }
+  }
+  // stats
+  const recent = T.log.filter((tp) => now - tp.t < 8), graded = recent.filter((tp) => tp.on !== null && tp.on !== undefined);
+  const onPct = graded.length ? Math.round((100 * graded.filter((tp) => tp.on).length) / graded.length) : null;
+  const perSec = T.log.filter((tp) => now - tp.t < 1).length;
+  c.font = `${Math.round(13 * dpr)}px -apple-system, system-ui, sans-serif`; c.textAlign = "left"; c.fillStyle = "rgba(255,255,255,0.75)";
+  const bpm = g ? Math.round(60 / g.period) : 0;
+  const parts = [g ? `${bpm} bpm${S.metro ? " metronome" : ""}` : "no beat yet: turn on the metronome or play music",
+    onPct !== null ? `on the grid ${onPct}%` : "", `${perSec} taps/s`, g ? `streak ${T.streak} (best ${T.best})` : ""].filter(Boolean);
+  c.fillText(parts.join("  ·  "), 12 * dpr, top ? H * 0.9 : H * 0.24);
+}
+function rgb(a) { return `rgb(${a.map((v) => Math.round(v * 255)).join(",")})`; }
+
 // ---------------- Auto switching ----------------
 // "Field": cycles the Field worlds. "Everything": cycles all modes and worlds.
 // With the music: switches on phrase boundaries (every 32 beats) or when the song
@@ -1831,9 +2124,12 @@ function render(now) {
   const t = (now - startTime) / 1000;
   updateScheme(t);
   autoTick(now);
+  if (S.mode !== "tap") hideRibbon();
 
   if (S.mode === "shadow") {
     run("shadow", null, common);
+  } else if (S.mode === "tap") {
+    renderTap(now, fit, common);
   } else if (S.mode === "field") {
     renderField(now, fit, common, t);
   } else if (S.mode === "trails" || S.mode === "paint") {
@@ -2072,6 +2368,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 function fmt(key, v) {
   if (key === "smooth" || key === "line") return v.toFixed(1);
   if (key === "autoSecs") return `${Math.round(v)}s`;
+  if (key === "tapBpm") return `${Math.round(v)}`;
   if (key === "delay") return v.toFixed(2);
   return v.toFixed(2);
 }
@@ -2089,11 +2386,16 @@ function syncUI() {
   $("autoByBtn").textContent = S.autoBy === "music" ? "With the music" : "On a timer";
   $("autoByBtn").style.display = S.auto === "off" ? "none" : "";
   $("autoSecsRow").style.display = S.auto !== "off" && (S.autoBy === "timer" || !M.on) ? "" : "none";
+  $("metroBtn").textContent = S.metro ? "Metronome: on" : "Metronome: off"; $("metroBtn").classList.toggle("on", S.metro);
+  $("clickBtn").textContent = S.metroClick ? "Click sound: on" : "Click sound: off"; $("clickBtn").classList.toggle("on", S.metroClick);
+  $("echoBtn").classList.toggle("on", S.tapEcho); $("ribbonBtn").classList.toggle("on", S.tapRibbon);
+  $("figureBtn").classList.toggle("on", S.tapFigure); $("heelToeBtn").classList.toggle("on", S.heelToe);
+  $("ribbonPosBtn").textContent = S.ribbonBottom ? "Ribbon at the bottom" : "Ribbon at the top";
   $("musicBtn").classList.toggle("on", M.on);
   $("musicBtn").textContent = M.on ? "Music: listening" : "Music: off";
   $("musicAmtRow").style.display = M.on ? "" : "none";
   $("beatSensRow").style.display = M.on ? "" : "none";
-  if (M.node) M.node.port.postMessage({ sens: S.beatSens });
+  if (M.node) M.node.port.postMessage({ sens: S.beatSens, tsens: S.tapSens });
   $("beatDelayBtn").textContent = S.partnerBeats ? `Delay: ${S.partnerBeats} beat${S.partnerBeats > 1 ? "s" : ""}` : "Delay: seconds";
   $("beatDelayBtn").classList.toggle("on", !!S.partnerBeats);
   document.querySelectorAll("#looks button").forEach((b) => b.classList.toggle("on", b.dataset.look === S.look));
@@ -2116,8 +2418,12 @@ function syncUI() {
   $("engineBtn").textContent = "Engine: " + S.engine.toUpperCase();
 }
 
-document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("click", () => {
+document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("click", async () => {
   S.mode = b.dataset.mode; save(); syncUI();
+  if (S.mode === "tap") {   // tap mode needs the microphone; start it from this tap
+    if (!M.on) { try { await startMusic(); } catch (e) { $("musicNote").textContent = "Tap mode needs the microphone. Allow it and try again."; } syncUI(); }
+    if (S.metro && !T.metroStart) startMetro();
+  }
   if (S.mode === "trails" || S.mode === "paint") clearFeedback();
 }));
 document.querySelectorAll("#looks button").forEach((b) => b.addEventListener("click", () => {
@@ -2128,12 +2434,18 @@ document.querySelectorAll("[data-world]").forEach((b) => b.addEventListener("cli
 $("clearWorldBtn").addEventListener("click", () => { worldKey = ""; clearFeedback(); });
 document.querySelectorAll("input[data-key]").forEach((inp) => inp.addEventListener("input", () => {
   S[inp.dataset.key] = parseFloat(inp.value);
-  if (inp.dataset.key === "beatSens" && M.node) M.node.port.postMessage({ sens: S.beatSens });
+  if ((inp.dataset.key === "beatSens" || inp.dataset.key === "tapSens") && M.node) M.node.port.postMessage({ sens: S.beatSens, tsens: S.tapSens });
+  if (inp.dataset.key === "tapBpm" && S.metro) startMetro();
   if (LOOK_KEYS.includes(inp.dataset.key) && S.look !== "custom") { S.look = "custom"; syncUI(); }
   inp.nextElementSibling.textContent = fmt(inp.dataset.key, S[inp.dataset.key]);
   save();
 }));
 $("clearBtn").addEventListener("click", clearFeedback);
+const flip = (id, key, after) => $(id).addEventListener("click", () => { S[key] = !S[key]; save(); syncUI(); after && after(); });
+flip("metroBtn", "metro", () => (S.metro ? startMetro() : stopMetro()));
+flip("clickBtn", "metroClick");
+flip("ribbonPosBtn", "ribbonBottom");
+flip("echoBtn", "tapEcho"); flip("ribbonBtn", "tapRibbon"); flip("figureBtn", "tapFigure"); flip("heelToeBtn", "heelToe");
 document.querySelectorAll("[data-scheme]").forEach((b) => b.addEventListener("click", () => { S.scheme = b.dataset.scheme; save(); syncUI(); }));
 $("autoBtn").addEventListener("click", () => {
   const order = ["off", "field", "all"]; S.auto = order[(order.indexOf(S.auto) + 1) % order.length];
@@ -2144,7 +2456,7 @@ $("musicBtn").addEventListener("click", async () => {
   const note = $("musicNote");
   if (M.on) { stopMusic(); note.textContent = ""; syncUI(); return; }
   note.textContent = "Starting the microphone…";
-  try { await startMusic(); note.textContent = "Play music from a speaker nearby. The meter at the top left shows what it hears."; }
+  try { await startMusic(); if (S.metro) startMetro(); note.textContent = "Play music from a speaker nearby. The meter at the top left shows what it hears."; }
   catch (e) { console.error(e); note.textContent = (e && e.name === "NotAllowedError") ? "Microphone permission was blocked. Allow it in the browser settings and try again." : "Couldn't start the microphone on this device."; }
   syncUI();
 });
@@ -2226,7 +2538,7 @@ else {
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, pick: () => currentPick(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, beats: () => M.beats.map((x) => +x.toFixed(3)), pick: () => currentPick(), tap: () => ({ n: T.log.length, graded: T.log.filter((x) => x.on !== null && x.on !== undefined).length, on: T.log.filter((x) => x.on).length, feet: T.feet.map((f) => f && f.map(Math.round)), streak: T.streak, times: T.log.map((x) => +x.t.toFixed(3)) }), startMetro: () => startMetro(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
