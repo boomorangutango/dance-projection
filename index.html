@@ -126,6 +126,9 @@
     <div class="section">
       <label class="slider">Smoothness <input data-key="smooth" type="range" min="0" max="8" step="0.5"><span></span></label>
       <label class="slider">Steadiness <input data-key="steady" type="range" min="0" max="0.85" step="0.05"><span></span></label>
+      <label class="slider">Stickiness <input data-key="sticky" type="range" min="0" max="0.45" step="0.05"><span></span></label>
+      <label class="slider">Speck cleanup <input data-key="cleanup" type="range" min="0" max="0.5" step="0.01"><span></span></label>
+      <label class="slider">Arm fill <input data-key="limbs" type="range" min="0" max="1.6" step="0.1"><span></span></label>
       <label class="slider">Cutoff <input data-key="cutoff" type="range" min="0.25" max="0.75" step="0.01"><span></span></label>
       <label class="slider">Softness <input data-key="soft" type="range" min="0" max="0.2" step="0.01"><span></span></label>
       <label class="slider">Glow <input data-key="glow" type="range" min="0" max="1" step="0.05"><span></span></label>
@@ -136,7 +139,8 @@
         <button id="fillBtn">Fill screen</button>
       </div>
       <div class="row">
-        <button id="modelBtn">Model: Fast</button>
+        <button id="modelBtn">Model: Body</button>
+        <button id="engineBtn">Engine: GPU</button>
         <button id="fullBtn">Fullscreen</button>
         <button id="resetBtn">Reset settings</button>
       </div>
@@ -156,32 +160,40 @@ const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
 const MODELS = {
+  // Full-body pose model: a body mask plus joint positions. Trained on whole bodies
+  // at a distance, so it suits dancing better than the selfie models.
+  body: {
+    label: "Body", kind: "pose",
+    url: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+  },
+  // Selfie models: made for video calls (one person close to the camera).
   fast: {
-    label: "Fast",
-    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
-    invert: false   // channel 0 = person
+    label: "Selfie", kind: "seg", invert: false,   // channel 0 = person
+    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
   },
   quality: {
-    label: "Quality",
-    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
-    invert: true    // channel 0 = background
+    label: "Selfie HQ", kind: "seg", invert: true, // channel 0 = background
+    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
   }
 };
+const MODEL_ORDER = ["body", "fast", "quality"];
 const DEMO = new URLSearchParams(location.search).has("demo");
 
 // ---------------- Settings (remembered on this device) ----------------
 const DEFAULTS = {
   mode: "shadow",
-  smooth: 3, steady: 0.3, cutoff: 0.45, soft: 0, glow: 0, size: 1,
-  style: "neon", line: 3, invert: false, fill: true,
+  smooth: 3, steady: 0.2, cutoff: 0.45, soft: 0, glow: 0, size: 1,
+  sticky: 0.3, cleanup: 0.15, limbs: 1,
+  style: "neon", line: 3, invert: false, fill: false,
   trailLength: 0.6,
   paintFade: 0.15, hueSpeed: 0.35,
   delay: 1.0, shift: 0, facing: true,
-  mirror: true, facingMode: "user", model: "fast"
+  mirror: true, facingMode: "user", model: "body", engine: "gpu"
 };
-const STORE_KEY = "shadow-partner-settings-v2";
+const STORE_KEY = "shadow-partner-settings-v3";
 let S = { ...DEFAULTS };
 try { Object.assign(S, JSON.parse(localStorage.getItem(STORE_KEY) || "{}")); } catch (e) {}
+if (!MODELS[S.model]) S.model = "body";
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch (e) {} }
 
 // ---------------- DOM ----------------
@@ -425,16 +437,117 @@ function clearFeedback() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// ---------------- Per-frame GPU pipeline ----------------
-function uploadMask(data, w, h, invert) {
+// ---------------- Mask cleanup (small image, done on the CPU) ----------------
+// probability -> sticky on/off -> arms and hands drawn from the pose joints
+// -> specks not connected to a person removed -> uploaded to the GPU
+let state = null, mark = null, labels = null, stack = null, prob = null;
+
+const BONES = [
+  // [a, b, kind]  kind: 0 torso, 1 arm, 2 hand, 3 leg
+  [11, 12, 0], [11, 23, 0], [12, 24, 0], [23, 24, 0],
+  [11, 13, 1], [13, 15, 1], [12, 14, 1], [14, 16, 1],
+  [15, 17, 2], [15, 19, 2], [15, 21, 2], [17, 19, 2],
+  [16, 18, 2], [16, 20, 2], [16, 22, 2], [18, 20, 2],
+  [23, 25, 3], [25, 27, 3], [24, 26, 3], [26, 28, 3],
+  [27, 29, 3], [27, 31, 3], [29, 31, 3], [28, 30, 3], [28, 32, 3], [30, 32, 3]
+];
+const BONE_RADIUS = [0.30, 0.17, 0.13, 0.20]; // as a fraction of shoulder width
+
+function drawCapsule(ax, ay, bx, by, r, w, h) {
+  const x0 = Math.max(0, Math.floor(Math.min(ax, bx) - r)), x1 = Math.min(w - 1, Math.ceil(Math.max(ax, bx) + r));
+  const y0 = Math.max(0, Math.floor(Math.min(ay, by) - r)), y1 = Math.min(h - 1, Math.ceil(Math.max(ay, by) + r));
+  const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1e-6, r2 = r * r;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      let t = ((x - ax) * dx + (y - ay) * dy) / len2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const ex = x - (ax + t * dx), ey = y - (ay + t * dy);
+      if (ex * ex + ey * ey <= r2) { const i = y * w + x; state[i] = 1; mark[i] = 1; }
+    }
+  }
+}
+
+function drawSkeleton(poses, w, h) {
+  for (const lm of poses) {
+    // Some versions report no visibility scores; then trust every joint.
+    const hasVis = lm.some((q) => q && q.visibility > 0);
+    const vis = (k) => !!lm[k] && (!hasVis || lm[k].visibility > 0.5);
+    const P = (k) => [lm[k].x * w, lm[k].y * h];
+    let scale = 0;
+    if (vis(11) && vis(12)) { const [a, b] = [P(11), P(12)]; scale = Math.hypot(a[0] - b[0], a[1] - b[1]); }
+    else if (vis(23) && vis(24)) { const [a, b] = [P(23), P(24)]; scale = Math.hypot(a[0] - b[0], a[1] - b[1]) * 1.4; }
+    if (scale < 4) continue; // too small or sideways: rely on the mask
+    for (const [a, b, kind] of BONES) {
+      if (!vis(a) || !vis(b)) continue;
+      const r = Math.max(1.5, scale * BONE_RADIUS[kind] * S.limbs);
+      const [ax, ay] = P(a), [bx, by] = P(b);
+      drawCapsule(ax, ay, bx, by, r, w, h);
+    }
+  }
+}
+
+// Remove specks: keep pieces that touch a tracked person, or that are at least
+// a fraction of the size of the biggest piece.
+const compArea = [], compKeep = [];
+function removeSpecks(w, h, havePose) {
+  const n = w * h;
+  labels.fill(0);
+  compArea.length = 1; let biggest = 0, label = 0;
+  const touch = [false];
+  for (let i = 0; i < n; i++) {
+    if (!state[i] || labels[i]) continue;
+    label++; let area = 0, touches = false, sp = 0;
+    stack[sp++] = i; labels[i] = label;
+    while (sp) {
+      const k = stack[--sp]; area++; if (mark[k]) touches = true;
+      const x = k % w;
+      if (x > 0 && state[k - 1] && !labels[k - 1]) { labels[k - 1] = label; stack[sp++] = k - 1; }
+      if (x < w - 1 && state[k + 1] && !labels[k + 1]) { labels[k + 1] = label; stack[sp++] = k + 1; }
+      if (k >= w && state[k - w] && !labels[k - w]) { labels[k - w] = label; stack[sp++] = k - w; }
+      if (k < n - w && state[k + w] && !labels[k + w]) { labels[k + w] = label; stack[sp++] = k + w; }
+    }
+    compArea[label] = area; touch[label] = touches;
+    if (area > biggest) biggest = area;
+  }
+  const minArea = Math.max(n * 0.0015, biggest * S.cleanup);
+  compKeep.length = label + 1;
+  for (let c = 1; c <= label; c++) compKeep[c] = (havePose && touch[c]) || compArea[c] >= minArea;
+  for (let i = 0; i < n; i++) if (labels[i] && !compKeep[labels[i]]) state[i] = 0;
+}
+
+function processMask(p, w, h, poses) {
   ensureMaskTargets(w, h);
   const n = w * h;
-  if (invert) for (let i = 0; i < n; i++) maskBytes[i] = 255 - data[i] * 255;
-  else for (let i = 0; i < n; i++) maskBytes[i] = data[i] * 255;
+  if (!state || state.length !== n) {
+    state = new Uint8Array(n); mark = new Uint8Array(n);
+    labels = new Int32Array(n); stack = new Int32Array(n);
+  }
+  // Sticky on/off: a pixel turns on above 0.5 but only turns off below 0.5 - stickiness.
+  const hi = 0.5, lo = Math.max(0.02, 0.5 - S.sticky);
+  for (let i = 0; i < n; i++) state[i] = state[i] ? (p[i] > lo ? 1 : 0) : (p[i] > hi ? 1 : 0);
+  mark.fill(0);
+  const havePose = poses && poses.length > 0 && S.limbs > 0;
+  if (havePose) drawSkeleton(poses, w, h);
+  if (S.cleanup > 0) removeSpecks(w, h, havePose);
+  for (let i = 0; i < n; i++) maskBytes[i] = state[i] * 255;
   gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
 }
 
+// Read a model mask into a person-probability buffer (union of all people).
+function readMasks(masks, invert) {
+  const m0 = masks[0], n = m0.width * m0.height;
+  if (!prob || prob.length !== n) prob = new Float32Array(n);
+  const a = m0.getAsFloat32Array();
+  if (invert) for (let i = 0; i < n; i++) prob[i] = 1 - a[i]; else prob.set(a);
+  for (let k = 1; k < masks.length; k++) {
+    const b = masks[k].getAsFloat32Array();
+    for (let i = 0; i < n; i++) if (b[i] > prob[i]) prob[i] = b[i];
+  }
+  return [prob, m0.width, m0.height];
+}
+
+// ---------------- Per-frame GPU pipeline ----------------
 function buildField(now) {
   // 1. Steadiness (temporal smoothing)
   run("steady", steadyB, (a) => { a.tex("u_new", maskTex); a.tex("u_prev", steadyA.tex); a.f("u_k", S.steady); });
@@ -528,20 +641,30 @@ function hueRGB(h) {
 }
 
 // ---------------- Model ----------------
-let vision = null, fileset = null, segmenter = null, switching = false;
+let vision = null, fileset = null, segmenter = null, segKind = "seg", switching = false;
 
 async function loadModel(key) {
   if (!vision) vision = await import(TASKS_URL);
   if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL);
-  const make = (delegate) => vision.ImageSegmenter.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: MODELS[key].url, delegate },
-    runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false
-  });
+  const M = MODELS[key];
+  const make = (delegate) => M.kind === "pose"
+    ? vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: M.url, delegate },
+        runningMode: "VIDEO", numPoses: 2, outputSegmentationMasks: true,
+        minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5
+      })
+    : vision.ImageSegmenter.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: M.url, delegate },
+        runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false
+      });
   let seg;
-  try { seg = await make("GPU"); }
-  catch (e) { console.warn("GPU delegate failed, using CPU", e); seg = await make("CPU"); }
+  if (S.engine === "cpu") seg = await make("CPU");
+  else {
+    try { seg = await make("GPU"); }
+    catch (e) { console.warn("GPU delegate failed, using CPU", e); seg = await make("CPU"); }
+  }
   if (segmenter) segmenter.close();
-  segmenter = seg;
+  segmenter = seg; segKind = M.kind;
 }
 
 // Small frame for the model. The model works at 256 px internally anyway, and its
@@ -580,7 +703,7 @@ window.addEventListener("resize", () => {
 
 // ---------------- Main loop ----------------
 let running = false, lastTs = 0;
-let frames = 0, fpsStart = performance.now(), segTotal = 0, workTotal = 0;
+let frames = 0, fpsStart = performance.now(), segTotal = 0, workTotal = 0, camDelivered = 0;
 
 function processFrame() {
   const now = performance.now();
@@ -593,11 +716,20 @@ function processFrame() {
 
   const ts = Math.max(now, lastTs + 1); lastTs = ts;
   const t0 = performance.now();
-  segmenter.segmentForVideo(proc, ts, (result) => {
-    const m = result.confidenceMasks && result.confidenceMasks[0];
-    if (!m) return;
-    uploadMask(m.getAsFloat32Array(), m.width, m.height, MODELS[S.model].invert);
-  });
+  let got = false;
+  if (segKind === "pose") {
+    segmenter.detectForVideo(proc, ts, (result) => {
+      const masks = result.segmentationMasks;
+      if (masks && masks.length) { const [p, w, h] = readMasks(masks, false); processMask(p, w, h, result.landmarks); got = true; }
+    });
+  } else {
+    segmenter.segmentForVideo(proc, ts, (result) => {
+      const masks = result.confidenceMasks;
+      if (masks && masks.length) { const [p, w, h] = readMasks([masks[0]], MODELS[S.model].invert); processMask(p, w, h, null); got = true; }
+    });
+  }
+  // No person found: show an empty wall (fade out through steadiness).
+  if (!got && maskW) { if (!prob || prob.length !== maskW * maskH) prob = new Float32Array(maskW * maskH); prob.fill(0); processMask(prob, maskW, maskH, null); }
   segTotal += performance.now() - t0;
   if (!maskW) return;
   buildField(now);
@@ -610,9 +742,10 @@ function countFrame(now) {
   frames++;
   if (now - fpsStart >= 1000) {
     const fps = Math.round(frames * 1000 / (now - fpsStart));
-    const cam = camFps ? ` · camera set to ${camFps}` : "";
+    const secs = (now - fpsStart) / 1000;
+    const cam = camDelivered ? ` · camera sending ${Math.round(camDelivered / secs)}` : (camFps ? ` · camera set to ${camFps}` : "");
     fpsEl.textContent = `${fps} fps · model ${(segTotal / frames).toFixed(0)} ms · total ${(workTotal / frames).toFixed(0)} ms${cam}`;
-    frames = 0; segTotal = 0; workTotal = 0; fpsStart = now;
+    frames = 0; segTotal = 0; workTotal = 0; camDelivered = 0; fpsStart = now;
   }
 }
 
@@ -621,7 +754,20 @@ function countFrame(now) {
 function loop() {
   if (!running) return;
   if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
-    const onFrame = () => { if (!running) return; processFrame(); video.requestVideoFrameCallback(onFrame); };
+    // The camera callback only notes a new frame; the heavy work runs right after
+    // as its own task, so it never holds up the screen's drawing step.
+    const mc = new MessageChannel();
+    let pending = false, lastPresented = -1;
+    mc.port1.onmessage = () => { pending = false; if (running) processFrame(); };
+    const onFrame = (_now, meta) => {
+      if (!running) return;
+      if (meta && meta.presentedFrames != null) {
+        if (lastPresented >= 0) camDelivered += Math.max(1, meta.presentedFrames - lastPresented);
+        lastPresented = meta.presentedFrames;
+      }
+      if (!pending) { pending = true; mc.port2.postMessage(0); }
+      video.requestVideoFrameCallback(onFrame);
+    };
     video.requestVideoFrameCallback(onFrame);
   } else {
     let lastTime = -1;
@@ -670,7 +816,12 @@ function demoLoop() {
     if (!running) return;
     const now = performance.now();
     const t0 = performance.now();
-    uploadMask(demoMask(now / 1000, w, h), w, h, false);
+    const dm = demoMask(now / 1000, w, h);
+    for (let b = 0; b < 6; b++) { // fake background specks
+      const bx = (Math.random() * w) | 0, by = (Math.random() * h) | 0;
+      for (let y = by; y < Math.min(h, by + 4); y++) for (let x = bx; x < Math.min(w, bx + 4); x++) dm[y * w + x] = 0.9;
+    }
+    processMask(dm, w, h, null);
     segTotal += performance.now() - t0;
     buildField(now); render(now); workTotal += performance.now() - now; countFrame(now);
     requestAnimationFrame(tick);
@@ -703,6 +854,7 @@ function syncUI() {
   $("facingBtn").classList.toggle("on", S.facing);
   $("facingBtn").textContent = S.facing ? "Facing me" : "Same direction";
   $("modelBtn").textContent = "Model: " + MODELS[S.model].label;
+  $("engineBtn").textContent = "Engine: " + S.engine.toUpperCase();
 }
 
 document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("click", () => {
@@ -728,10 +880,19 @@ $("flipBtn").addEventListener("click", async () => {
 });
 $("modelBtn").addEventListener("click", async () => {
   if (DEMO) return;
-  const next = S.model === "fast" ? "quality" : "fast";
+  const next = MODEL_ORDER[(MODEL_ORDER.indexOf(S.model) + 1) % MODEL_ORDER.length];
   const btn = $("modelBtn"); btn.disabled = true; btn.textContent = "Loading…";
   switching = true;
   try { await loadModel(next); S.model = next; save(); } catch (e) { console.error(e); }
+  switching = false; btn.disabled = false; syncUI();
+});
+$("engineBtn").addEventListener("click", async () => {
+  if (DEMO) return;
+  const btn = $("engineBtn"); btn.disabled = true; btn.textContent = "Loading…";
+  const prev = S.engine;
+  S.engine = S.engine === "gpu" ? "cpu" : "gpu";
+  switching = true;
+  try { await loadModel(S.model); save(); } catch (e) { console.error(e); S.engine = prev; }
   switching = false; btn.disabled = false; syncUI();
 });
 $("fullBtn").addEventListener("click", () => {
@@ -772,12 +933,13 @@ startBtn.addEventListener("click", async () => {
 if (DEMO) { statusEl.textContent = "Demo mode (no camera)"; startBtn.disabled = false; }
 else {
   loadModel(S.model)
+    .catch((e) => { console.error(e); if (S.model === "fast") throw e; S.model = "fast"; syncUI(); return loadModel("fast"); })
     .then(() => { statusEl.textContent = "Ready"; startBtn.disabled = false; })
     .catch((e) => { console.error(e); statusEl.textContent = "Could not load the body-tracking model. Check the connection and reload."; });
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
