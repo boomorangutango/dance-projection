@@ -48,7 +48,11 @@
   #controls.show { display: flex; }
   .modes, .styles, .looks { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .looks { grid-template-columns: repeat(5, 1fr); }
-  .modes { grid-template-columns: repeat(6, 1fr); }
+  .modes { grid-template-columns: repeat(4, 1fr); }
+  .skins { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .skins button { font-size: 12px; padding: 9px 2px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d0d; color: var(--fg); }
+  .skins button.on { border-color: var(--fg); background: #222; }
+  #troupe { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; display: none; }
   #ribbon { position: fixed; left: 0; top: 0; width: 100vw; height: max(90px, 18vh); pointer-events: none; display: none; }
   #ribbon.bottom { top: auto; bottom: 0; }
   .worlds { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
@@ -113,6 +117,7 @@
     <button data-mode="partner">Partner</button>
     <button data-mode="field">Field</button>
     <button data-mode="tap">Tap</button>
+    <button data-mode="troupe">Troupe</button>
   </div>
 
   <div class="section">
@@ -193,6 +198,29 @@
     <label class="slider" id="returnRow"><span id="returnLabel">Return</span> <input data-key="springBack" type="range" min="0" max="2" step="0.1"><span></span></label>
     <div class="row" id="clearWorldRow"><button id="clearWorldBtn">Start over</button></div>
   </div>
+  <div class="section" data-for="troupe">
+    <div class="skins" id="skins">
+      <button data-skin="glow">Glow</button>
+      <button data-skin="mannequin">Mannequin</button>
+      <button data-skin="marionette">Marionette</button>
+      <button data-skin="robot">Robot</button>
+      <button data-skin="skeleton">Skeleton</button>
+      <button data-skin="dragon">Dragon</button>
+    </div>
+    <label class="slider">Copies <input data-key="copies" type="range" min="0" max="4" step="1"><span></span></label>
+    <label class="slider">Canon delay <input data-key="canon" type="range" min="0" max="1.5" step="0.05"><span></span></label>
+    <div class="row">
+      <button id="mirrorCopiesBtn">Mirror copies</button>
+      <button id="mixedBtn">Mixed skins</button>
+      <button id="showMeBtn">Show me</button>
+    </div>
+    <div class="row">
+      <button id="recBtn">Record a loop</button>
+      <button id="clearLoopsBtn">Clear loops</button>
+    </div>
+    <label class="slider">Loop length <input data-key="loopBeats" type="range" min="2" max="16" step="2"><span></span></label>
+    <div class="hint" style="text-align:left">Recording counts in (or waits a bar when music is on), records the loop length, then that dancer keeps looping. Keys: R or space record, C clear, A / - copies, S next skin.</div>
+  </div>
   <div class="section" data-for="tap">
     <div class="row">
       <button id="metroBtn">Metronome: off</button>
@@ -252,7 +280,7 @@
 // ======================================================================
 
 // Bump with every change so the phone shows which version it loaded.
-const APP_VERSION = "v14";
+const APP_VERSION = "v15";
 const TASKS_VERSION = "0.10.14";
 const TASKS_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
@@ -284,6 +312,7 @@ const DEFAULTS = {
   look: "smooth",
   musicAmt: 1, beatSens: 1.25, partnerBeats: 0,
   auto: "off", autoBy: "changes", autoSecs: 30, scheme: "natural",
+  skin: "glow", copies: 2, canon: 0.4, mirrorCopies: true, mixedSkins: false, showMe: true, loopBeats: 8,
   tapBpm: 100, ribbonBottom: false, metro: false, metroClick: false, tapEcho: true, tapRibbon: true, tapFigure: true, heelToe: false, tapSens: 1,
   world: "dots", fieldMode: "scatter", dots: 1, push: 1, springBack: 1,
   style: "neon", line: 3, invert: false, fill: true,
@@ -2102,6 +2131,544 @@ function drawRibbon(now, g) {
 }
 function rgb(a) { return `rgb(${a.map((v) => Math.round(v * 255)).join(",")})`; }
 
+// ---------------- Troupe: generated dancers ----------------
+// The pose model gives 33 body points (MediaPipe numbering). We keep a short
+// history of them, then draw generated dancers from it: you, copies of you
+// (in unison or canon, some mirrored), and recorded loops that keep dancing.
+const LM = { nose: 0, lEar: 7, rEar: 8, lSh: 11, rSh: 12, lEl: 13, rEl: 14, lWr: 15, rWr: 16, lPi: 17, rPi: 18, lIn: 19, rIn: 20, lTh: 21, rTh: 22,
+  lHip: 23, rHip: 24, lKn: 25, rKn: 26, lAn: 27, rAn: 28, lHe: 29, rHe: 30, lFt: 31, rFt: 32 };
+const SKINS = ["glow", "mannequin", "marionette", "robot", "skeleton", "dragon"];
+const SKIN_LABEL = { glow: "Glow", mannequin: "Mannequin", marionette: "Marionette", robot: "Robot", skeleton: "Skeleton", dragon: "Dragon" };
+
+let poseLm = null, poseLoading = false;
+const PZ = {
+  hist: [],                 // {t, p: Float32Array(132)}  (x, y, z, visibility) in full-frame 0..1
+  live: null, lastSeen: 0,  // smoothed latest pose
+  loops: [],                // {frames: [{t, p}], len, start, skin, slot, shift}
+  rec: null,                // {phase: "count" | "rec", until, startAt, frames: []}
+  fire: [], aspect: 4 / 3
+};
+
+async function ensurePoseModel() {
+  if (poseLm || poseLoading || DEMO) return;
+  poseLoading = true;
+  try {
+    if (!vision) vision = await import(TASKS_URL);
+    if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL);
+    const make = (delegate) => vision.PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODELS.body.url, delegate },
+      runningMode: "VIDEO", numPoses: 1, outputSegmentationMasks: false,
+      minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+    try { poseLm = await make(S.engine === "cpu" ? "CPU" : "GPU"); } catch (e) { poseLm = await make("CPU"); }
+  } catch (e) { console.error("pose model failed", e); }
+  poseLoading = false;
+}
+
+// New pose from the model (or the demo): smooth it and add to the history.
+function pushPose(p, t) {
+  if (!PZ.live) PZ.live = p.slice();
+  else {
+    // light smoothing: steady when still, quick when moving
+    for (let i = 0; i < 33; i++) {
+      const o = i * 4, dx = p[o] - PZ.live[o], dy = p[o + 1] - PZ.live[o + 1];
+      const k = Math.min(1, 0.45 + Math.hypot(dx, dy) * 12);
+      PZ.live[o] += dx * k; PZ.live[o + 1] += dy * k; PZ.live[o + 2] += (p[o + 2] - PZ.live[o + 2]) * k; PZ.live[o + 3] = p[o + 3];
+    }
+  }
+  PZ.lastSeen = t;
+  PZ.hist.push({ t, p: PZ.live.slice() });
+  while (PZ.hist.length && t - PZ.hist[0].t > 9000) PZ.hist.shift();
+  if (PZ.rec && PZ.rec.phase === "rec") PZ.rec.frames.push({ t, p: PZ.live.slice() });
+}
+function poseFromLandmarks(lms) {
+  const p = new Float32Array(132);
+  for (let i = 0; i < 33; i++) { const l = lms[i]; p[i * 4] = l.x; p[i * 4 + 1] = l.y; p[i * 4 + 2] = l.z; p[i * 4 + 3] = l.visibility ?? 1; }
+  return p;
+}
+// Pose at a past moment (interpolated between the two nearest frames).
+function poseAt(list, t) {
+  if (!list.length) return null;
+  if (t <= list[0].t) return list[0].p;
+  if (t >= list[list.length - 1].t) return list[list.length - 1].p;
+  let lo = 0, hi = list.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (list[m].t <= t) lo = m; else hi = m; }
+  const a = list[lo], b = list[hi], f = (t - a.t) / Math.max(1, b.t - a.t), out = new Float32Array(132);
+  for (let i = 0; i < 132; i++) out[i] = a.p[i] + (b.p[i] - a.p[i]) * f;
+  return out;
+}
+
+// Synthetic dancer for ?demo (matches the demo silhouette's motion).
+function demoPose(t) {
+  const w = 320, h = 240, cx = w * (0.5 + 0.18 * Math.sin(t * 0.7)), cy = h * 0.5, u = h / 10;
+  const s = Math.sin(t * 2.2), c = Math.cos(t * 1.6), p = new Float32Array(132);
+  const set = (i, x, y, z = 0) => { p[i * 4] = x / w; p[i * 4 + 1] = y / h; p[i * 4 + 2] = z; p[i * 4 + 3] = 1; };
+  const limb = (x0, y0, a1, l1, a2, l2) => { const x1 = x0 + Math.sin(a1) * l1, y1 = y0 + Math.cos(a1) * l1; return [x1, y1, x1 + Math.sin(a2) * l2, y1 + Math.cos(a2) * l2]; };
+  set(LM.nose, cx + 0.15 * u, cy - 3.2 * u, -0.05); set(LM.lEar, cx + 0.45 * u, cy - 3.25 * u); set(LM.rEar, cx - 0.45 * u, cy - 3.25 * u);
+  set(2, cx + 0.25 * u, cy - 3.35 * u); set(5, cx - 0.1 * u, cy - 3.35 * u);
+  const shL = [cx + 0.6 * u, cy - 2.1 * u], shR = [cx - 0.6 * u, cy - 2.1 * u];
+  set(LM.lSh, ...shL); set(LM.rSh, ...shR);
+  const aL = limb(shL[0], shL[1], Math.PI * (0.55 + 0.35 * s), 1.4 * u, Math.PI * (0.75 + 0.4 * c), 1.3 * u);
+  const aR = limb(shR[0], shR[1], -Math.PI * (0.55 - 0.35 * c), 1.4 * u, -Math.PI * (0.8 + 0.3 * s), 1.3 * u);
+  set(LM.lEl, aL[0], aL[1], 0.02); set(LM.lWr, aL[2], aL[3], 0.03); set(LM.rEl, aR[0], aR[1], -0.02); set(LM.rWr, aR[2], aR[3], -0.03);
+  for (const [w0, el, a, z] of [[LM.lWr, LM.lEl, aL, 0.03], [LM.rWr, LM.rEl, aR, -0.03]]) {
+    const dx = a[2] - a[0], dy = a[3] - a[1], L = Math.hypot(dx, dy) || 1, ex = a[2] + (dx / L) * 0.35 * u, ey = a[3] + (dy / L) * 0.35 * u;
+    const base = w0 === LM.lWr ? [LM.lPi, LM.lIn, LM.lTh] : [LM.rPi, LM.rIn, LM.rTh];
+    set(base[0], ex - (dy / L) * 0.1 * u, ey + (dx / L) * 0.1 * u, z); set(base[1], ex, ey, z); set(base[2], ex + (dy / L) * 0.15 * u, ey - (dx / L) * 0.15 * u, z);
+  }
+  const hL = [cx + 0.4 * u, cy + 0.6 * u], hR = [cx - 0.4 * u, cy + 0.6 * u];
+  set(LM.lHip, ...hL); set(LM.rHip, ...hR);
+  const lL = limb(hL[0], hL[1], 0.25 + 0.3 * s, 1.8 * u, 0.1 + 0.2 * s, 1.8 * u), lR = limb(hR[0], hR[1], -0.25 + 0.3 * c, 1.8 * u, -0.1 - 0.2 * c, 1.8 * u);
+  set(LM.lKn, lL[0], lL[1]); set(LM.lAn, lL[2], lL[3]); set(LM.rKn, lR[0], lR[1]); set(LM.rAn, lR[2], lR[3]);
+  set(LM.lHe, lL[2] - 0.15 * u, lL[3] + 0.15 * u); set(LM.rHe, lR[2] - 0.15 * u, lR[3] + 0.15 * u);
+  set(LM.lFt, lL[2] + 0.45 * u, lL[3] + 0.2 * u); set(LM.rFt, lR[2] + 0.45 * u, lR[3] + 0.2 * u);
+  return p;
+}
+
+// ---- placing a pose on the wall ----
+function troupeFit() {
+  const sw = window.innerWidth, sh = window.innerHeight, a = PZ.aspect;
+  const s = (S.fill ? Math.max(sw / a, sh) : Math.min(sw / a, sh)) * S.size;
+  const w = s * a, h = s;
+  return { x0: (sw - w) / 2, y0: (sh - h) / 2, w, h };
+}
+// screen points for one dancer; dx shifts it, flip mirrors it about its own middle, sc scales it about its feet
+function placePose(p, fit, dx = 0, flip = false, sc = 1, recenterX = null) {
+  const pts = new Array(33);
+  let cxSum = 0;
+  for (let i = 0; i < 33; i++) {
+    let x = p[i * 4]; if (S.mirror) x = 1 - x;
+    pts[i] = [fit.x0 + x * fit.w, fit.y0 + p[i * 4 + 1] * fit.h, p[i * 4 + 2] * fit.w];
+  }
+  const mid = (pts[LM.lHip][0] + pts[LM.rHip][0]) / 2;
+  const feet = Math.max(pts[LM.lAn][1], pts[LM.rAn][1]);
+  const shift = recenterX !== null ? recenterX - mid : 0;
+  for (const q of pts) {
+    if (flip) q[0] = 2 * mid - q[0];
+    q[0] = mid + (q[0] - mid) * sc + dx + shift;
+    q[1] = feet + (q[1] - feet) * sc;
+    q[2] *= sc;
+  }
+  return pts;
+}
+
+// ---- drawing helpers ----
+const tcan = document.createElement("canvas");
+tcan.id = "troupe";
+document.body.insertBefore(tcan, $("fader"));
+const tc = tcan.getContext("2d");
+const mid2 = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, ((a[2] || 0) + (b[2] || 0)) / 2];
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+function capsule(a, b, r1, r2) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+  const ang = Math.atan2(dy, dx);
+  tc.beginPath();
+  tc.arc(a[0], a[1], r1, ang + Math.PI / 2, ang + (3 * Math.PI) / 2);
+  tc.lineTo(b[0] - nx * r2, b[1] - ny * r2);
+  tc.arc(b[0], b[1], r2, ang - Math.PI / 2, ang + Math.PI / 2);
+  tc.lineTo(a[0] + nx * r1, a[1] + ny * r1);
+  tc.closePath();
+}
+function segGrad(a, b, r, c1, c2) {   // light from the upper left, across the limb
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L, m = mid2(a, b);
+  const sgn = nx + ny < 0 ? 1 : -1;
+  const g = tc.createLinearGradient(m[0] + nx * r * sgn, m[1] + ny * r * sgn, m[0] - nx * r * sgn, m[1] - ny * r * sgn);
+  g.addColorStop(0, c1); g.addColorStop(1, c2); return g;
+}
+function ball(p, r, fill) { tc.beginPath(); tc.arc(p[0], p[1], r, 0, Math.PI * 2); tc.fillStyle = fill; tc.fill(); }
+function rgba(c, a = 1) { return `rgba(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)},${a})`; }
+function shade(c, k) { return c.map((v) => Math.max(0, Math.min(1, v * k))); }
+
+// Body parts, drawn far-to-near using the model's depth (z: smaller is nearer).
+function bodyParts(P) {
+  const z = (...ids) => ids.reduce((s, i) => s + P[i][2], 0) / ids.length;
+  return [
+    { kind: "leg", side: "l", ids: [LM.lHip, LM.lKn, LM.lAn, LM.lHe, LM.lFt], z: z(LM.lKn, LM.lAn) },
+    { kind: "leg", side: "r", ids: [LM.rHip, LM.rKn, LM.rAn, LM.rHe, LM.rFt], z: z(LM.rKn, LM.rAn) },
+    { kind: "torso", z: z(LM.lSh, LM.rSh, LM.lHip, LM.rHip) + 0.001 },
+    { kind: "head", z: P[LM.nose][2] - 0.002 },
+    { kind: "arm", side: "l", ids: [LM.lSh, LM.lEl, LM.lWr, LM.lIn, LM.lPi, LM.lTh], z: z(LM.lEl, LM.lWr) },
+    { kind: "arm", side: "r", ids: [LM.rSh, LM.rEl, LM.rWr, LM.rIn, LM.rPi, LM.rTh], z: z(LM.rEl, LM.rWr) }
+  ].sort((a, b) => b.z - a.z);
+}
+function unitOf(P) {
+  const sh = dist(P[LM.lSh], P[LM.rSh]), torso = dist(mid2(P[LM.lSh], P[LM.rSh]), mid2(P[LM.lHip], P[LM.rHip]));
+  return Math.max(sh, torso * 0.55, 8);
+}
+function handPoint(P, ids) { const [, , w, i, p, t] = ids; return [(P[w][0] + P[i][0] + P[p][0] + P[t][0]) / 4, (P[w][1] + P[i][1] + P[p][1] + P[t][1]) / 4, P[w][2]]; }
+
+// ---- skins ----
+function drawDancer(P, skin, color, alpha, t) {
+  tc.save(); tc.globalAlpha = alpha;
+  const U = unitOf(P), beat = M.on ? M.beat * S.musicAmt : 0;
+  const neck = mid2(P[LM.lSh], P[LM.rSh]), pelvis = mid2(P[LM.lHip], P[LM.rHip]);
+  const ear = mid2(P[LM.lEar], P[LM.rEar]), head = [(P[LM.nose][0] * 0.4 + ear[0] * 0.6), (P[LM.nose][1] * 0.4 + ear[1] * 0.6)];
+  const headR = Math.max(U * 0.3, dist(P[LM.lEar], P[LM.rEar]) * 0.75);
+  const face = Math.sign(P[LM.nose][0] - ear[0]) || 1;
+  tc.lineCap = "round"; tc.lineJoin = "round";
+
+  if (skin === "dragon") drawTail(P, pelvis, neck, U, color, t);
+  if (skin === "dragon") { drawWing(P, "l", U, color); drawWing(P, "r", U, color); }
+  if (skin === "marionette") drawStrings(P, head, headR, U);
+
+  for (const part of bodyParts(P)) {
+    if (part.kind === "torso") drawTorso(P, skin, color, U, neck, pelvis, beat);
+    else if (part.kind === "head") drawHead(P, skin, color, U, head, headR, face, beat, t);
+    else drawLimb(P, part, skin, color, U, beat);
+  }
+  tc.restore();
+}
+
+function limbStyle(skin, color) {
+  switch (skin) {
+    case "mannequin": return { light: "#e9c9a0", dark: "#9c6f45", joint: "#7a5232" };
+    case "marionette": return { light: "#f0d2b0", dark: "#b88a5e", joint: "#5a3d26", sleeve: ["#e8473c", "#9d1f19"], pants: ["#3f6fd8", "#1d3b86"] };
+    case "robot": return { light: "#c9d1db", dark: "#5a6372", joint: "#2e343d" };
+    case "skeleton": return { light: "#f4f1e8", dark: "#bdb7a6", joint: "#f4f1e8" };
+    case "dragon": return { light: rgba(color), dark: rgba(shade(color, 0.45)), joint: rgba(shade(color, 0.35)) };
+    default: return { light: rgba(color), dark: rgba(color), joint: rgba(color) };
+  }
+}
+
+function drawLimb(P, part, skin, color, U, beat) {
+  const st = limbStyle(skin, color), arm = part.kind === "arm";
+  const [a, b, c] = part.ids.map((i) => P[i]);
+  const r1 = U * (arm ? 0.15 : 0.21), r2 = U * (arm ? 0.12 : 0.16), r3 = U * (arm ? 0.1 : 0.12);
+  if (skin === "glow") {
+    tc.shadowColor = rgba(color); tc.shadowBlur = U * (0.5 + beat * 0.8);
+    tc.strokeStyle = rgba(color); tc.lineWidth = r2 * 1.6;
+    tc.beginPath(); tc.moveTo(a[0], a[1]); tc.lineTo(b[0], b[1]); tc.lineTo(c[0], c[1]); tc.stroke();
+    if (arm) { const h = handPoint(P, part.ids); tc.lineWidth = r3 * 1.4; tc.beginPath(); tc.moveTo(c[0], c[1]); tc.lineTo(h[0], h[1]); tc.stroke(); }
+    else { const f = P[part.ids[4]]; tc.lineWidth = r3 * 1.4; tc.beginPath(); tc.moveTo(c[0], c[1]); tc.lineTo(f[0], f[1]); tc.stroke(); }
+    tc.shadowBlur = 0; return;
+  }
+  if (skin === "skeleton") {
+    tc.shadowColor = "rgba(255,255,255,0.6)"; tc.shadowBlur = U * 0.25;
+    bone(a, b, U * (arm ? 0.05 : 0.065)); bone(b, c, U * 0.045);
+    if (!arm) bone([b[0] + U * 0.04, b[1]], [c[0] + U * 0.04, c[1]], U * 0.025);
+    if (arm) { const h = handPoint(P, part.ids); for (const id of part.ids.slice(3)) bone(c, P[id], U * 0.018); ball(h, U * 0.04, st.light); }
+    else bone(c, P[part.ids[4]], U * 0.04);
+    tc.shadowBlur = 0; return;
+  }
+  if (skin === "robot") {
+    box(a, b, r1 * 1.05, st); box(b, c, r2 * 1.05, st);
+    ball(b, r2 * 0.75, st.joint); ball(b, r2 * 0.35, "#8fd6ff");
+    if (arm) { const h = handPoint(P, part.ids); box(c, h, r3, st); ball(c, r3 * 0.7, st.joint); }
+    else { box(c, P[part.ids[4]], r3 * 1.1, st); ball(c, r3 * 0.7, st.joint); }
+    return;
+  }
+  if (skin === "dragon") {
+    if (arm) { capsule(a, b, r1 * 0.8, r2 * 0.7); tc.fillStyle = segGrad(a, b, r1, st.light, st.dark); tc.fill(); capsule(b, c, r2 * 0.7, r3 * 0.6); tc.fillStyle = segGrad(b, c, r2, st.light, st.dark); tc.fill(); return; }
+    capsule(a, b, r1 * 1.2, r2 * 1.1); tc.fillStyle = segGrad(a, b, r1, st.light, st.dark); tc.fill();
+    capsule(b, c, r2 * 1.0, r3 * 0.9); tc.fillStyle = segGrad(b, c, r2, st.light, st.dark); tc.fill();
+    const f = P[part.ids[4]], dx = f[0] - c[0], dy = f[1] - c[1];   // claws
+    tc.fillStyle = "#f2e6c8";
+    for (let k = -1; k <= 1; k++) {
+      const ang = Math.atan2(dy, dx) + k * 0.35, L = U * 0.32;
+      tc.beginPath(); tc.moveTo(c[0] + Math.cos(ang + 1.4) * U * 0.05, c[1] + Math.sin(ang + 1.4) * U * 0.05);
+      tc.lineTo(c[0] + Math.cos(ang) * L * 1.6, c[1] + Math.sin(ang) * L * 1.6); tc.lineTo(c[0] + Math.cos(ang - 1.4) * U * 0.05, c[1] + Math.sin(ang - 1.4) * U * 0.05); tc.fill();
+    }
+    return;
+  }
+  // mannequin / marionette: shaded wooden segments with ball joints
+  const cols = skin === "marionette" ? (arm ? st.sleeve : st.pants) : [st.light, st.dark];
+  capsule(a, b, r1, r2); tc.fillStyle = segGrad(a, b, r1, cols[0], cols[1]); tc.fill();
+  const lower = skin === "marionette" && arm ? [st.light, st.dark] : cols;
+  capsule(b, c, r2 * 0.92, r3); tc.fillStyle = segGrad(b, c, r2, lower[0], lower[1]); tc.fill();
+  ball(b, r2 * 0.85, st.joint); ball(a, r1 * 0.7, st.joint);
+  if (arm) { const h = handPoint(P, part.ids); capsule(c, h, r3 * 0.9, r3 * 1.15); tc.fillStyle = segGrad(c, h, r3, st.light, st.dark); tc.fill(); ball(c, r3 * 0.7, st.joint); }
+  else {
+    const f = P[part.ids[4]], he = P[part.ids[3]];
+    tc.beginPath(); tc.moveTo(he[0], he[1]); tc.lineTo(c[0], c[1]); tc.lineTo(f[0], f[1]); tc.closePath();
+    tc.lineWidth = r3 * 1.4; tc.strokeStyle = skin === "marionette" ? "#2b1d14" : st.dark; tc.stroke(); tc.fillStyle = tc.strokeStyle; tc.fill();
+    ball(c, r3 * 0.75, st.joint);
+  }
+}
+function bone(a, b, w) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+  tc.strokeStyle = "#f4f1e8"; tc.lineWidth = w; tc.beginPath(); tc.moveTo(a[0], a[1]); tc.lineTo(b[0], b[1]); tc.stroke();
+  for (const p of [a, b]) for (const s of [-1, 1]) ball([p[0] + nx * w * 0.7 * s, p[1] + ny * w * 0.7 * s], w * 0.75, "#f4f1e8");
+}
+function box(a, b, r, st) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+  tc.beginPath();
+  tc.moveTo(a[0] + nx * r, a[1] + ny * r); tc.lineTo(b[0] + nx * r * 0.9, b[1] + ny * r * 0.9);
+  tc.lineTo(b[0] - nx * r * 0.9, b[1] - ny * r * 0.9); tc.lineTo(a[0] - nx * r, a[1] - ny * r); tc.closePath();
+  tc.fillStyle = segGrad(a, b, r, st.light, st.dark); tc.fill();
+  tc.strokeStyle = "rgba(20,24,30,0.6)"; tc.lineWidth = Math.max(1, r * 0.12); tc.stroke();
+}
+
+function drawTorso(P, skin, color, U, neck, pelvis, beat) {
+  const st = limbStyle(skin, color);
+  const ls = P[LM.lSh], rs = P[LM.rSh], lh = P[LM.lHip], rh = P[LM.rHip];
+  if (skin === "glow") {
+    tc.shadowColor = rgba(color); tc.shadowBlur = U * (0.6 + beat);
+    tc.fillStyle = rgba(color, 0.35); tc.strokeStyle = rgba(color); tc.lineWidth = U * 0.12;
+    tc.beginPath(); tc.moveTo(ls[0], ls[1]); tc.lineTo(rs[0], rs[1]); tc.lineTo(rh[0], rh[1]); tc.lineTo(lh[0], lh[1]); tc.closePath(); tc.fill(); tc.stroke();
+    tc.shadowBlur = 0; return;
+  }
+  if (skin === "skeleton") {
+    tc.strokeStyle = "#f4f1e8"; tc.shadowColor = "rgba(255,255,255,0.6)"; tc.shadowBlur = U * 0.25;
+    tc.lineWidth = U * 0.07; tc.beginPath(); tc.moveTo(neck[0], neck[1]); tc.lineTo(pelvis[0], pelvis[1]); tc.stroke();   // spine
+    tc.lineWidth = U * 0.045;
+    for (let k = 0; k < 4; k++) {                                                                                         // ribs
+      const f = 0.12 + k * 0.13, y0 = neck[1] + (pelvis[1] - neck[1]) * f, x0 = neck[0] + (pelvis[0] - neck[0]) * f, wR = dist(ls, rs) * (0.5 - k * 0.05);
+      tc.beginPath(); tc.ellipse(x0, y0 + U * 0.05, wR, U * 0.12, 0, Math.PI * 1.05, Math.PI * 1.95, true); tc.stroke();
+    }
+    bone(ls, rs, U * 0.05);
+    tc.beginPath(); tc.ellipse(pelvis[0], pelvis[1], dist(lh, rh) * 0.65, U * 0.17, 0, 0, Math.PI * 2); tc.stroke();      // pelvis
+    tc.shadowBlur = 0; return;
+  }
+  if (skin === "dragon") {
+    tc.beginPath(); tc.moveTo(ls[0], ls[1]); tc.quadraticCurveTo(neck[0], neck[1] - U * 0.15, rs[0], rs[1]);
+    tc.lineTo(rh[0], rh[1]); tc.quadraticCurveTo(pelvis[0], pelvis[1] + U * 0.2, lh[0], lh[1]); tc.closePath();
+    tc.fillStyle = segGrad(neck, pelvis, dist(ls, rs) * 0.6, st.light, st.dark); tc.fill();
+    tc.strokeStyle = "rgba(240,220,150,0.55)"; tc.lineWidth = U * 0.04;                                                   // belly plates
+    for (let k = 1; k <= 4; k++) { const m = [neck[0] + (pelvis[0] - neck[0]) * k / 5, neck[1] + (pelvis[1] - neck[1]) * k / 5]; tc.beginPath(); tc.ellipse(m[0], m[1], U * 0.22, U * 0.06, 0, 0, Math.PI); tc.stroke(); }
+    return;
+  }
+  if (skin === "robot") {
+    box(neck, pelvis, dist(ls, rs) * 0.55, st);
+    tc.fillStyle = `rgba(120,220,255,${0.35 + 0.65 * Math.min(1, beat + 0.2)})`;                                          // chest light
+    const c = mid2(neck, pelvis); tc.beginPath(); tc.arc(c[0], c[1] - U * 0.15, U * 0.12, 0, Math.PI * 2); tc.fill();
+    return;
+  }
+  // mannequin / marionette: chest and hips with a waist joint
+  const chestCol = skin === "marionette" ? ["#e8473c", "#9d1f19"] : [st.light, st.dark];
+  const waist = [neck[0] + (pelvis[0] - neck[0]) * 0.62, neck[1] + (pelvis[1] - neck[1]) * 0.62];
+  tc.beginPath(); tc.moveTo(ls[0], ls[1]); tc.lineTo(rs[0], rs[1]);
+  tc.quadraticCurveTo(rs[0] + (waist[0] - rs[0]) * 0.4, waist[1], waist[0] - (rs[0] - ls[0]) * 0.18, waist[1]);
+  tc.lineTo(waist[0] + (rs[0] - ls[0]) * 0.18, waist[1]); tc.quadraticCurveTo(ls[0] + (waist[0] - ls[0]) * 0.4, waist[1], ls[0], ls[1]); tc.closePath();
+  tc.fillStyle = segGrad(neck, waist, U * 0.5, chestCol[0], chestCol[1]); tc.fill();
+  if (skin === "marionette") { for (let k = 1; k <= 3; k++) ball([neck[0] + (waist[0] - neck[0]) * k / 4, neck[1] + (waist[1] - neck[1]) * k / 4], U * 0.035, "#ffd34d"); }
+  const hipCol = skin === "marionette" ? ["#3f6fd8", "#1d3b86"] : [st.light, st.dark];
+  tc.beginPath(); tc.moveTo(lh[0] + (lh[0] - rh[0]) * 0.15, lh[1]); tc.lineTo(rh[0] + (rh[0] - lh[0]) * 0.15, rh[1]);
+  tc.lineTo(waist[0] + (rh[0] - lh[0]) * 0.3, waist[1] + U * 0.05); tc.lineTo(waist[0] - (rh[0] - lh[0]) * 0.3, waist[1] + U * 0.05); tc.closePath();
+  tc.fillStyle = segGrad(waist, pelvis, U * 0.4, hipCol[0], hipCol[1]); tc.fill();
+  ball(waist, U * 0.11, st.joint);
+  capsule(neck, [neck[0] + (P[LM.nose][0] - neck[0]) * 0.35, neck[1] + (P[LM.nose][1] - neck[1]) * 0.35], U * 0.09, U * 0.08);
+  tc.fillStyle = st.light; tc.fill();
+}
+
+function drawHead(P, skin, color, U, head, r, face, beat, t) {
+  const st = limbStyle(skin, color);
+  let tilt = Math.atan2(P[LM.rEar][1] - P[LM.lEar][1], P[LM.rEar][0] - P[LM.lEar][0]);
+  if (tilt > Math.PI / 2) tilt -= Math.PI; else if (tilt < -Math.PI / 2) tilt += Math.PI;
+  tilt *= 0.5;
+  if (skin === "glow") {
+    tc.shadowColor = rgba(color); tc.shadowBlur = U * (0.6 + beat);
+    tc.fillStyle = rgba(color, 0.35); tc.strokeStyle = rgba(color); tc.lineWidth = U * 0.1;
+    tc.beginPath(); tc.arc(head[0], head[1], r, 0, Math.PI * 2); tc.fill(); tc.stroke(); tc.shadowBlur = 0; return;
+  }
+  if (skin === "skeleton") {
+    tc.shadowColor = "rgba(255,255,255,0.6)"; tc.shadowBlur = U * 0.25;
+    ball(head, r, "#f4f1e8"); tc.shadowBlur = 0;
+    tc.fillStyle = "#f4f1e8"; tc.beginPath(); tc.ellipse(head[0] + face * r * 0.15, head[1] + r * 0.75, r * 0.55, r * 0.35, 0, 0, Math.PI * 2); tc.fill();
+    ball([head[0] + face * r * 0.1 - r * 0.35, head[1] - r * 0.05], r * 0.24, "#000"); ball([head[0] + face * r * 0.1 + r * 0.35, head[1] - r * 0.05], r * 0.24, "#000");
+    tc.fillStyle = "#000"; tc.beginPath(); tc.moveTo(head[0] + face * r * 0.1, head[1] + r * 0.18); tc.lineTo(head[0] + face * r * 0.1 - r * 0.1, head[1] + r * 0.4); tc.lineTo(head[0] + face * r * 0.1 + r * 0.1, head[1] + r * 0.4); tc.fill();
+    return;
+  }
+  if (skin === "robot") {
+    tc.save(); tc.translate(head[0], head[1]); tc.rotate(tilt);
+    const g = tc.createLinearGradient(-r, -r, r, r); g.addColorStop(0, st.light); g.addColorStop(1, st.dark);
+    tc.fillStyle = g; tc.fillRect(-r, -r * 1.05, r * 2, r * 2); tc.strokeStyle = "rgba(20,24,30,0.6)"; tc.lineWidth = r * 0.08; tc.strokeRect(-r, -r * 1.05, r * 2, r * 2);
+    tc.fillStyle = `rgba(110,230,255,${0.55 + 0.45 * Math.min(1, beat + 0.2)})`; tc.shadowColor = "#6ef"; tc.shadowBlur = r * 0.8;
+    tc.fillRect(-r * 0.75 + face * r * 0.1, -r * 0.35, r * 1.5, r * 0.35); tc.shadowBlur = 0;
+    tc.strokeStyle = st.dark; tc.lineWidth = r * 0.1; tc.beginPath(); tc.moveTo(0, -r * 1.05); tc.lineTo(0, -r * 1.5); tc.stroke(); ball([0, -r * 1.55], r * 0.14, "#f55");
+    tc.restore(); return;
+  }
+  if (skin === "dragon") {
+    tc.save(); tc.translate(head[0], head[1]); tc.scale(face, 1);
+    tc.fillStyle = st.light;
+    tc.beginPath(); tc.moveTo(-r * 0.9, -r * 0.4); tc.quadraticCurveTo(r * 0.2, -r * 1.1, r * 1.0, -r * 0.35);
+    tc.lineTo(r * 2.0, -r * 0.05); tc.lineTo(r * 1.95, r * 0.3); tc.lineTo(r * 0.7, r * 0.55); tc.quadraticCurveTo(-r * 0.4, r * 0.95, -r * 0.9, r * 0.3); tc.closePath(); tc.fill();
+    tc.fillStyle = st.dark; tc.beginPath(); tc.moveTo(r * 0.6, r * 0.25); tc.lineTo(r * 1.9, r * 0.3); tc.lineTo(r * 0.6, r * 0.5); tc.fill();               // jaw line
+    tc.fillStyle = "#f2e6c8";
+    for (const [hx, hy, len] of [[-0.6, -0.7, 1.1], [-0.15, -0.85, 0.9]]) { tc.beginPath(); tc.moveTo(hx * r, hy * r); tc.quadraticCurveTo((hx - 0.6) * r, (hy - len * 0.6) * r, (hx - 0.9) * r, (hy - len) * r); tc.lineTo((hx + 0.25) * r, hy * r); tc.fill(); }
+    const glowEye = 0.6 + 0.4 * Math.min(1, beat * 1.5);
+    tc.fillStyle = `rgba(255,${Math.round(200 + 55 * glowEye)},60,1)`; tc.shadowColor = "#fc4"; tc.shadowBlur = r * glowEye;
+    tc.beginPath(); tc.ellipse(r * 0.55, -r * 0.3, r * 0.2, r * 0.12, 0, 0, Math.PI * 2); tc.fill(); tc.shadowBlur = 0;
+    tc.restore();
+    if (M.on && beat > 0.55 && Math.random() < 0.6) breatheFire(head[0] + face * r * 2, head[1] + r * 0.1, face, U);
+    return;
+  }
+  // mannequin / marionette
+  tc.save(); tc.translate(head[0], head[1]); tc.rotate(tilt);
+  const g = tc.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r * 1.2);
+  g.addColorStop(0, st.light); g.addColorStop(1, st.dark);
+  tc.fillStyle = g; tc.beginPath(); tc.ellipse(0, 0, r * 0.85, r * 1.05, 0, 0, Math.PI * 2); tc.fill();
+  if (skin === "marionette") {
+    ball([face * r * 0.15 - r * 0.28, -r * 0.1], r * 0.1, "#1b1b1b"); ball([face * r * 0.15 + r * 0.28, -r * 0.1], r * 0.1, "#1b1b1b");
+    ball([face * r * 0.15 - r * 0.4, r * 0.25], r * 0.14, "rgba(230,90,90,0.55)"); ball([face * r * 0.15 + r * 0.4, r * 0.25], r * 0.14, "rgba(230,90,90,0.55)");
+    tc.strokeStyle = "#7a2a1a"; tc.lineWidth = r * 0.07; tc.beginPath(); tc.arc(face * r * 0.15, r * 0.3, r * 0.22, 0.2, Math.PI - 0.2); tc.stroke();
+    tc.fillStyle = "#5a3d26"; tc.beginPath(); tc.ellipse(0, -r * 0.85, r * 0.8, r * 0.35, 0, Math.PI, 0); tc.fill();        // painted hair
+  }
+  tc.restore();
+}
+
+function drawStrings(P, head, r, U) {
+  const barY = Math.max(6, head[1] - U * 3.2), tilt = (P[LM.rSh][1] - P[LM.lSh][1]) * 0.3;
+  const bar = [[head[0] - U * 1.1, barY + tilt], [head[0] + U * 1.1, barY - tilt]], cross = [[head[0], barY - U * 0.5], [head[0], barY + U * 0.5]];
+  tc.strokeStyle = "rgba(235,235,235,0.55)"; tc.lineWidth = 1;
+  const anchors = [[head[0], head[1] - r], P[LM.lWr], P[LM.rWr], P[LM.lKn], P[LM.rKn]];
+  const tops = [[head[0], barY], bar[1], bar[0], cross[0], cross[1]];
+  for (let i = 0; i < anchors.length; i++) { tc.beginPath(); tc.moveTo(tops[i][0], tops[i][1]); tc.lineTo(anchors[i][0], anchors[i][1]); tc.stroke(); }
+  tc.strokeStyle = "#8a6440"; tc.lineWidth = U * 0.08;
+  tc.beginPath(); tc.moveTo(bar[0][0], bar[0][1]); tc.lineTo(bar[1][0], bar[1][1]); tc.moveTo(cross[0][0], cross[0][1]); tc.lineTo(cross[1][0], cross[1][1]); tc.stroke();
+}
+
+function drawWing(P, side, U, color) {
+  const S_ = P[side === "l" ? LM.lSh : LM.rSh], E = P[side === "l" ? LM.lEl : LM.rEl], W = P[side === "l" ? LM.lWr : LM.rWr], H = P[side === "l" ? LM.lHip : LM.rHip];
+  const tip = [W[0] + (W[0] - E[0]) * 0.7, W[1] + (W[1] - E[1]) * 0.7];
+  const fingers = [0.25, 0.5, 0.75].map((f) => [tip[0] + (H[0] - tip[0]) * f + (H[0] - S_[0]) * 0.25, tip[1] + (H[1] - tip[1]) * f + U * 0.35]);
+  tc.beginPath(); tc.moveTo(S_[0], S_[1]); tc.lineTo(E[0], E[1]); tc.lineTo(W[0], W[1]); tc.lineTo(tip[0], tip[1]);
+  let prev = tip;
+  for (const f of [...fingers, H]) { const m = mid2(prev, f); tc.quadraticCurveTo(m[0] - (f[1] - prev[1]) * 0.15, m[1] - U * 0.25, f[0], f[1]); prev = f; }
+  tc.closePath();
+  tc.fillStyle = rgba(shade(color, 0.8), 0.45); tc.fill();
+  tc.strokeStyle = rgba(shade(color, 0.5), 0.9); tc.lineWidth = U * 0.04;
+  for (const f of fingers) { tc.beginPath(); tc.moveTo(W[0], W[1]); tc.lineTo(f[0], f[1]); tc.stroke(); }
+  tc.beginPath(); tc.moveTo(W[0], W[1]); tc.lineTo(tip[0], tip[1]); tc.stroke();
+}
+function drawTail(P, pelvis, neck, U, color, t) {
+  const dx = pelvis[0] - neck[0], dy = pelvis[1] - neck[1], L = Math.hypot(dx, dy) || 1;
+  let ang = Math.atan2(dy, dx) + 0.6, x = pelvis[0], y = pelvis[1];
+  const pts = [[x, y]];
+  for (let i = 1; i <= 12; i++) { ang += 0.18 * Math.sin(t * 2.2 - i * 0.55); x += Math.cos(ang) * U * 0.28; y += Math.sin(ang) * U * 0.28; pts.push([x, y]); }
+  const left = [], right = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)], ddx = b[0] - a[0], ddy = b[1] - a[1], l = Math.hypot(ddx, ddy) || 1, w = U * 0.22 * (1 - i / pts.length);
+    left.push([pts[i][0] - (ddy / l) * w, pts[i][1] + (ddx / l) * w]); right.push([pts[i][0] + (ddy / l) * w, pts[i][1] - (ddx / l) * w]);
+  }
+  tc.beginPath(); tc.moveTo(left[0][0], left[0][1]); for (const p of left) tc.lineTo(p[0], p[1]); for (const p of right.reverse()) tc.lineTo(p[0], p[1]); tc.closePath();
+  tc.fillStyle = rgba(shade(color, 0.75)); tc.fill();
+  tc.fillStyle = "#f2e6c8";                                                                                   // spikes along the top
+  for (let i = 1; i < pts.length - 2; i += 2) { const p = right[pts.length - 1 - i] || pts[i]; tc.beginPath(); tc.moveTo(p[0], p[1]); tc.lineTo(p[0] + U * 0.04, p[1] - U * 0.14); tc.lineTo(p[0] + U * 0.1, p[1]); tc.fill(); }
+}
+function breatheFire(x, y, face, U) {
+  for (let i = 0; i < 10; i++) PZ.fire.push({ x, y, vx: face * U * (4 + Math.random() * 4), vy: (Math.random() - 0.5) * U * 2, life: 0.5 + Math.random() * 0.3, r: U * (0.08 + Math.random() * 0.1) });
+}
+function drawFire(dt) {
+  tc.save(); tc.globalCompositeOperation = "lighter";
+  PZ.fire = PZ.fire.filter((f) => (f.life -= dt) > 0);
+  for (const f of PZ.fire) {
+    f.x += f.vx * dt; f.y += f.vy * dt - 20 * dt; f.r *= 1 + dt * 1.5;
+    const k = f.life / 0.8;
+    tc.fillStyle = `rgba(255,${Math.round(120 + 120 * k)},${Math.round(40 * k)},${0.5 * k})`;
+    tc.beginPath(); tc.arc(f.x, f.y, f.r, 0, Math.PI * 2); tc.fill();
+  }
+  tc.restore();
+}
+
+// ---- the troupe: who is on the wall ----
+const DANCER_COLORS = [[1, 1, 1], [0.55, 0.8, 1], [1, 0.6, 0.8], [0.65, 1, 0.7], [1, 0.82, 0.45]];
+function dancerColor(i) {
+  if (currentScheme) return [currentScheme[2], currentScheme[1], currentScheme[0].map((v) => Math.min(1, v * 1.4)), currentScheme[1], currentScheme[2]][i % 5];
+  return DANCER_COLORS[i % DANCER_COLORS.length];
+}
+function skinFor(i) { return S.mixedSkins ? SKINS[(SKINS.indexOf(S.skin) + i) % SKINS.length] : S.skin; }
+
+let troupeLast = 0, troupeRunning = false;
+function troupeLoop(now) {
+  if (S.mode !== "troupe") { troupeRunning = false; tcan.style.display = "none"; return; }
+  requestAnimationFrame(troupeLoop);
+  const dt = Math.min(0.1, (now - (troupeLast || now)) / 1000); troupeLast = now;
+  if (DEMO && running) pushPose(demoPose(now / 1000), now);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const W = Math.round(window.innerWidth * dpr), H = Math.round(window.innerHeight * dpr);
+  if (tcan.width !== W || tcan.height !== H) { tcan.width = W; tcan.height = H; }
+  tcan.style.display = "block";
+  tc.setTransform(1, 0, 0, 1, 0, 0); tc.fillStyle = S.invert ? "#fff" : "#000"; tc.fillRect(0, 0, W, H);
+  tc.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const fit = troupeFit(), t = now / 1000;
+  updateRecording(now);
+
+  const dancers = [];   // {P, skin, color, alpha}
+  const liveVisible = PZ.live && now - PZ.lastSeen < 700;
+  const fade = liveVisible ? Math.min(1, 1 - (now - PZ.lastSeen - 300) / 400) : 0;
+  const me = liveVisible ? placePose(PZ.live, fit) : null;
+  const centreX = me ? (me[LM.lHip][0] + me[LM.rHip][0]) / 2 : window.innerWidth / 2;
+  const U = me ? unitOf(me) : fit.h * 0.09;
+  const copies = liveVisible ? S.copies : 0, others = copies + PZ.loops.length;
+  // places alternate right, left, further right, further left... spaced to fit the wall
+  const spacing = Math.min(U * 3.2, (window.innerWidth * 0.92) / (others + 1));
+  const place = (k) => { const side = k % 2 ? 1 : -1, rank = Math.ceil(k / 2); let x = centreX + side * rank * spacing;
+    const W = window.innerWidth; if (x < U) x += Math.ceil((U - x) / spacing) * spacing * 0; return Math.min(W - U * 0.8, Math.max(U * 0.8, x)); };
+  // loops, behind the copies
+  PZ.loops.forEach((lp, k) => {
+    const idx = copies + k + 1, p = poseAt(lp.frames, lp.frames[0].t + ((now - lp.start) % lp.len));
+    dancers.push({ P: placePose(p, fit, 0, lp.flip, 0.88, place(idx)), skin: skinFor(idx), color: dancerColor(idx), alpha: 0.95 });
+  });
+  // copies of you: same moves, or a little later each (canon), alternate ones mirrored
+  for (let i = 1; i <= copies; i++) {
+    const delay = S.canon * i * 1000, p = delay > 0 ? poseAt(PZ.hist, now - delay) : PZ.live;
+    if (!p) continue;
+    const flip = S.mirrorCopies && i % 2 === 1, rank = Math.ceil(i / 2);
+    dancers.push({ P: placePose(p, fit, 0, flip, 0.92 - rank * 0.04, place(i)), skin: skinFor(i), color: dancerColor(i), alpha: fade * 0.95 });
+  }
+  if (me && S.showMe) dancers.push({ P: me, skin: skinFor(0), color: dancerColor(0), alpha: fade });
+  for (const d of dancers) drawDancer(d.P, d.skin, d.color, d.alpha, t);
+  drawFire(dt);
+  drawRecordingBadge(now);
+  if (!liveVisible && !PZ.loops.length) {
+    tc.fillStyle = "rgba(255,255,255,0.55)"; tc.font = "15px -apple-system, system-ui, sans-serif"; tc.textAlign = "center";
+    tc.fillText(DEMO || poseLm ? "Step into view" : "Loading the body tracker…", window.innerWidth / 2, window.innerHeight / 2);
+  }
+}
+function startTroupe() {
+  ensurePoseModel();
+  if (!troupeRunning) { troupeRunning = true; troupeLast = 0; requestAnimationFrame(troupeLoop); }
+}
+
+// ---- recording loops ----
+// Press once: 3-second countdown (or wait for the next beat when music is on), then
+// it records for the loop length and the recording becomes a looping dancer.
+function loopLengthMs() { return M.on && M.period ? S.loopBeats * M.period * 1000 : S.loopBeats * 500; }
+function toggleRecord() {
+  if (PZ.rec) {   // stop early: keep what we have if it's long enough
+    if (PZ.rec.phase === "rec" && PZ.rec.frames.length > 10) finishLoop(); else PZ.rec = null;
+    return;
+  }
+  const now = performance.now();
+  PZ.rec = { phase: "count", until: now + (M.on && M.period ? M.period * 1000 * 4 : 3000), frames: [] };
+}
+function updateRecording(now) {
+  const r = PZ.rec; if (!r) return;
+  if (r.phase === "count" && now >= r.until) { r.phase = "rec"; r.startAt = now; r.until = now + loopLengthMs(); r.frames = []; }
+  else if (r.phase === "rec" && now >= r.until) finishLoop();
+}
+function finishLoop() {
+  const r = PZ.rec; PZ.rec = null;
+  if (!r || r.frames.length < 6) return;
+  const len = r.frames[r.frames.length - 1].t - r.frames[0].t;
+  if (PZ.loops.length >= 6) PZ.loops.shift();
+  PZ.loops.push({ frames: r.frames, len: Math.max(500, len), start: performance.now(), flip: PZ.loops.length % 2 === 1 });
+}
+function clearLoops() { PZ.loops = []; PZ.rec = null; }
+function drawRecordingBadge(now) {
+  const r = PZ.rec; if (!r) return;
+  tc.font = "600 18px -apple-system, system-ui, sans-serif"; tc.textAlign = "center";
+  if (r.phase === "count") {
+    const s = Math.ceil((r.until - now) / 1000);
+    tc.fillStyle = "rgba(255,255,255,0.85)"; tc.fillText(M.on && M.period ? `Recording on the beat… ${s}` : `Recording in ${s}`, window.innerWidth / 2, 34);
+  } else {
+    const left = Math.max(0, (r.until - now) / 1000);
+    tc.fillStyle = "#ff4d4d"; tc.beginPath(); tc.arc(window.innerWidth / 2 - 62, 28, 7, 0, Math.PI * 2); tc.fill();
+    tc.fillStyle = "rgba(255,255,255,0.9)"; tc.fillText(`REC ${left.toFixed(1)}s`, window.innerWidth / 2 + 6, 34);
+  }
+}
+
+// ---- keys (a programmable foot pedal usually types keys, so this is where it will plug in) ----
+window.addEventListener("keydown", (e) => {
+  if (S.mode !== "troupe" || e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === "r" || k === " ") { toggleRecord(); e.preventDefault(); }
+  else if (k === "c") clearLoops();
+  else if (k === "a" || k === "=" || k === "+") { S.copies = Math.min(4, S.copies + 1); save(); syncUI(); }
+  else if (k === "-") { S.copies = Math.max(0, S.copies - 1); save(); syncUI(); }
+  else if (k === "s") { S.skin = SKINS[(SKINS.indexOf(S.skin) + 1) % SKINS.length]; save(); syncUI(); }
+});
+
 // ---------------- Auto switching ----------------
 // "Field": cycles the Field worlds. "Everything": cycles all modes and worlds.
 // With the music: switches on phrase boundaries (every 32 beats) or when the song
@@ -2311,6 +2878,21 @@ let frames = 0, fpsStart = performance.now(), segTotal = 0, workTotal = 0, camDe
 function processFrame() {
   const now = performance.now();
   const vw = video.videoWidth, vh = video.videoHeight;
+  if (S.mode === "troupe") {   // generated dancers: only the pose model runs
+    if (!vw || !vh) return;
+    const k = PROC_LONG / Math.max(vw, vh), pw = Math.round(vw * k), ph = Math.round(vh * k);
+    if (proc.width !== pw || proc.height !== ph) { proc.width = pw; proc.height = ph; }
+    procCtx.drawImage(video, 0, 0, pw, ph);
+    PZ.aspect = vw / vh;
+    const ts = Math.max(now, lastTs + 1); lastTs = ts;
+    if (poseLm) {
+      const res = poseLm.detectForVideo(proc, ts);
+      if (res && res.landmarks && res.landmarks[0]) pushPose(poseFromLandmarks(res.landmarks[0]), now);
+    }
+    segTotal += performance.now() - now; workTotal += performance.now() - now;
+    countFrame(now);
+    return;
+  }
   if (!vw || !vh || !segmenter || switching) return;
   const k = PROC_LONG / Math.max(vw, vh);
   const pw = Math.round(vw * k), ph = Math.round(vh * k);
@@ -2447,6 +3029,9 @@ function fmt(key, v) {
   if (key === "smooth" || key === "line") return v.toFixed(1);
   if (key === "autoSecs") return `${Math.round(v)}s`;
   if (key === "tapBpm") return `${Math.round(v)}`;
+  if (key === "copies") return `${Math.round(v)}`;
+  if (key === "loopBeats") return M.on && M.period ? `${v} beats` : `${(v * 0.5).toFixed(0)}s`;
+  if (key === "canon") return `${v.toFixed(2)}s`;
   if (key === "delay") return v.toFixed(2);
   return v.toFixed(2);
 }
@@ -2469,6 +3054,8 @@ function syncUI() {
   $("echoBtn").classList.toggle("on", S.tapEcho); $("ribbonBtn").classList.toggle("on", S.tapRibbon);
   $("figureBtn").classList.toggle("on", S.tapFigure); $("heelToeBtn").classList.toggle("on", S.heelToe);
   $("ribbonPosBtn").textContent = S.ribbonBottom ? "Ribbon at the bottom" : "Ribbon at the top";
+  document.querySelectorAll("[data-skin]").forEach((b) => b.classList.toggle("on", b.dataset.skin === S.skin));
+  $("mirrorCopiesBtn").classList.toggle("on", S.mirrorCopies); $("mixedBtn").classList.toggle("on", S.mixedSkins); $("showMeBtn").classList.toggle("on", S.showMe);
   $("musicBtn").classList.toggle("on", M.on);
   $("musicBtn").textContent = M.on ? "Music: listening" : "Music: off";
   $("musicAmtRow").style.display = M.on ? "" : "none";
@@ -2498,6 +3085,7 @@ function syncUI() {
 
 document.querySelectorAll("#modes button").forEach((b) => b.addEventListener("click", async () => {
   S.mode = b.dataset.mode; save(); syncUI();
+  if (S.mode === "troupe" && running) startTroupe();
   if (S.mode === "tap") {   // tap mode needs the microphone; start it from this tap
     if (!M.on) { try { await startMusic(); } catch (e) { $("musicNote").textContent = "Tap mode needs the microphone. Allow it and try again."; } syncUI(); }
     if (S.metro && !T.metroStart) startMetro();
@@ -2523,6 +3111,10 @@ const flip = (id, key, after) => $(id).addEventListener("click", () => { S[key] 
 flip("metroBtn", "metro", () => (S.metro ? startMetro() : stopMetro()));
 flip("clickBtn", "metroClick");
 flip("ribbonPosBtn", "ribbonBottom");
+flip("mirrorCopiesBtn", "mirrorCopies"); flip("mixedBtn", "mixedSkins"); flip("showMeBtn", "showMe");
+document.querySelectorAll("[data-skin]").forEach((b) => b.addEventListener("click", () => { S.skin = b.dataset.skin; save(); syncUI(); }));
+$("recBtn").addEventListener("click", () => { toggleRecord(); controls.classList.remove("show"); fpsEl.classList.remove("show"); });
+$("clearLoopsBtn").addEventListener("click", clearLoops);
 flip("echoBtn", "tapEcho"); flip("ribbonBtn", "tapRibbon"); flip("figureBtn", "tapFigure"); flip("heelToeBtn", "heelToe");
 document.querySelectorAll("[data-scheme]").forEach((b) => b.addEventListener("click", () => { S.scheme = b.dataset.scheme; save(); syncUI(); }));
 $("autoBtn").addEventListener("click", () => {
@@ -2594,13 +3186,13 @@ startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
   if (DEMO) {
     intro.style.display = "none"; controls.classList.add("show"); fpsEl.classList.add("show");
-    running = true; demoLoop(); return;
+    running = true; demoLoop(); if (S.mode === "troupe") startTroupe(); return;
   }
   statusEl.textContent = "Starting camera…";
   try {
     await startCamera();
     intro.style.display = "none"; controls.classList.add("show"); fpsEl.classList.add("show");
-    running = true; keepAwake(); loop();
+    running = true; keepAwake(); loop(); if (S.mode === "troupe") startTroupe();
   } catch (e) {
     console.error(e);
     startBtn.disabled = false;
@@ -2619,7 +3211,7 @@ else {
 }
 
 // Expose a tiny hook for automated testing.
-window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, beats: () => M.beats.map((x) => +x.toFixed(3)), pick: () => currentPick(), events: () => SD.log || [], tap: () => ({ n: T.log.length, graded: T.log.filter((x) => x.on !== null && x.on !== undefined).length, on: T.log.filter((x) => x.on).length, feet: T.feet.map((f) => f && f.map(Math.round)), streak: T.streak, times: T.log.map((x) => +x.t.toFixed(3)) }), startMetro: () => startMetro(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
+window.__shadowPartner = { settings: () => S, set: (k, v) => { S[k] = v; syncUI(); }, processMask, roi: () => roi, beats: () => M.beats.map((x) => +x.toFixed(3)), pick: () => currentPick(), troupe: () => ({ loops: PZ.loops.length, live: !!PZ.live, rec: PZ.rec && PZ.rec.phase }), record: () => toggleRecord(), events: () => SD.log || [], tap: () => ({ n: T.log.length, graded: T.log.filter((x) => x.on !== null && x.on !== undefined).length, on: T.log.filter((x) => x.on).length, feet: T.feet.map((f) => f && f.map(Math.round)), streak: T.streak, times: T.log.map((x) => +x.t.toFixed(3)) }), startMetro: () => startMetro(), music: () => ({ on: M.on, worklet: M.worklet, pulse: +M.pulse.toFixed(2), bpm: M.bpm, beats: M.beatCount, energy: +M.energy.toFixed(2), bass: +M.bass.toFixed(2) }), setFull: (w, h) => { fullW = w; fullH = h; }, draw: (t) => { buildField(t); render(t); } };
 </script>
 </body>
 </html>
